@@ -11,3 +11,6 @@ mio = {version = "0.7", features = ["os-poll", "os-util", "udp"]}
 log = "0.4"
 pico-args = "0.3"
 stderrlog = "0.4"
+simple-error = "0.2"
+circbuf = "0.1"
+byteorder = "1"
