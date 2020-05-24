@@ -3,13 +3,15 @@ use {
     std::{
         //os::unix::io::AsRawFd,
         cmp::Ordering,
-        io::{Cursor, Read, Write, IoSlice, IoSliceMut},
         collections::{BTreeSet},
+        io::{Cursor, Read, Write, IoSlice, IoSliceMut},
+        ops::{Range, RangeBounds, Bound},
         vec::Vec,
     },
     //log::{info, trace, warn, error, debug},
     circbuf::CircBuf,
     byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
+    ranges::{GenericRange, Ranges},
 };
 
 pub trait CircRead {
@@ -66,35 +68,11 @@ impl Sequence {
     }
 }
 
-#[derive(Debug, Eq, Clone)]
-struct Fragment {
-    offset: u64, // global stream offset
-    size: usize,
-}
-
-impl Ord for Fragment {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.offset.cmp(&other.offset)
-    }
-}
-
-impl PartialOrd for Fragment {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.offset.cmp(&other.offset))
-    }
-}
-
-impl PartialEq for Fragment {
-    fn eq(&self, other: &Self) -> bool {
-        self.offset == other.offset
-    }
-}
-
 pub struct Packetizer {
     buffer: CircBuf,
     packet_seq: Sequence,
-    fragments: BTreeSet<Fragment>,
-    buffered_bytes: u64,
+    fragments: Ranges<u64>,
+    ack_bytes: u64, // amount of bytes acknowledged by the receiver
 }
 
 fn write_from_offset<T: Write>(buffer: &mut /*FIXME WHY mut*/ CircBuf, offset: usize, dest: &mut T) -> std::io::Result<usize> {
@@ -102,11 +80,30 @@ fn write_from_offset<T: Write>(buffer: &mut /*FIXME WHY mut*/ CircBuf, offset: u
     let bufs = buffer.get_bytes();
     let len0 = bufs[0].len();
     let len1 = bufs[1].len();
-    let off1 = std::cmp::max(if offset < len0 { 0 } else { offset - len0 }, len1);
+    let off1 = std::cmp::min(if offset < len0 { 0 } else { offset - len0 }, len1);
     let bufs = [
-        IoSlice::new(&bufs[0][std::cmp::min(offset,len0)..len0]),
-        IoSlice::new(&bufs[1][off1..len1])];
+        IoSlice::new(&bufs[0][std::cmp::min(offset, len0) .. len0]),
+        IoSlice::new(&bufs[1][off1 .. len1])];
     dest.write_vectored(&bufs)
+}
+
+#[derive(Clone, Debug)]
+struct Fragment {
+    offset: u64, // offset from start of the data transfer
+    size: usize,
+}
+
+impl From<&GenericRange<u64>> for Fragment {
+    fn from(range: &GenericRange<u64>) -> Fragment {
+        match (range.start_bound(), range.end_bound()) {
+            // FIXME handle: (a) u64 wraparound; (b) size being larger than usize (e.g. 32 bit)
+            (Bound::Included(s), Bound::Included(e)) => Fragment{ offset: *s , size: (*e - *s + 1) as usize },
+            (Bound::Included(s), Bound::Excluded(e)) => Fragment{ offset: *s, size: (*e - *s) as usize },
+            (Bound::Excluded(s), Bound::Excluded(e)) => Fragment{ offset: *s+1, size: (*e - *s - 1) as usize },
+            (Bound::Excluded(s), Bound::Included(e)) => Fragment{ offset: *s+1, size: (*e - *s) as usize },
+            _ => { panic!("Unbounded range to fragment does not make any sense") }
+        }
+    }
 }
 
 impl Packetizer {
@@ -114,25 +111,18 @@ impl Packetizer {
         Packetizer {
             buffer: CircBuf::with_capacity(buffer_capacity).unwrap(),
             packet_seq: Sequence::new(),
-            fragments: BTreeSet::new(),
-            buffered_bytes: 0,
+            fragments: Ranges::new(),
+            ack_bytes: 0,
         }
     }
 
     pub fn write_from(&mut self, source: &mut dyn CircRead) -> std::io::Result<usize> {
+        let begin = self.ack_bytes + self.buffer.len() as u64;
         let read = source.read(&mut self.buffer)?;
-
-        if self.fragments.is_empty() {
-            self.fragments.insert(Fragment{offset: self.buffered_bytes, size: read});
-        } else {
-            // FIXME what?! measure perf
-            let mut fragment = self.fragments.iter().next_back().unwrap().clone();
-            self.fragments.remove(&fragment);
-            fragment.size += read;
-            self.fragments.insert(fragment);
-        }
-
-        self.buffered_bytes += read as u64;
+        let range = begin .. read as u64;
+        println!("{:?}, {:?}", self.fragments, read);
+        self.fragments.insert(range);
+        println!("{:?}", self.fragments);
         Ok(read)
     }
 
@@ -140,10 +130,11 @@ impl Packetizer {
         let mut left = buf.len() - 4;
         let mut frags = Vec::<Fragment>::new();
 
-        for fragment in &self.fragments {
+        for fragment in self.fragments.as_slice() {
             if left < 7 || frags.len() > 15 { break; }
             left -= 6; // offset + size
 
+            let fragment : Fragment = fragment.into();
             frags.push(fragment.clone());
             left -= std::cmp::min(left, fragment.size);
         }
@@ -161,15 +152,33 @@ impl Packetizer {
             let to_write = std::cmp::min(left, frag.size);
             assert!(to_write < 65535);
             wr.write_u16::<LittleEndian>(to_write as u16).unwrap();
-            let offset = /* FIXME!!!! */ frag.offset as usize;
+            let offset = (frag.offset - self.ack_bytes) as usize;
             write_from_offset(&mut self.buffer, offset, &mut wr).unwrap();
+            self.fragments.remove(frag.offset .. frag.offset + frag.size as u64);
         }
 
         Ok(wr.position() as usize)
     }
 
-    pub fn confirm_read(&mut self, offset: u64) -> std::io::Result<()> {
-        unimplemented!()
+    pub fn confirm_read(&mut self, offset: u64) -> std::io::Result<usize> {
+        // 3. offset is correct < bytes sent
+        if offset > self.ack_bytes + self.buffer.len() as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                format!("Confirmed read offset {} exceeded theoretical limit of {}", offset, self.ack_bytes + self.buffer.len() as u64)));
+        }
+
+        if offset <= self.ack_bytes {
+            return Ok(0);
+        }
+
+        let read = offset - self.ack_bytes;
+
+        // 2. erase any fragments before offset
+        self.fragments.remove(self.ack_bytes..offset);
+
+        // 1. move ack_bytes
+        self.ack_bytes = offset;
+        Ok(read as usize)
     }
 
     pub fn resend(&mut self, offset: u64, size: usize) -> std::io::Result<()> {
@@ -183,14 +192,23 @@ mod tests {
 
     #[test]
     fn test_basic_packet_formation() {
-        let data =  b"kek";
-        let mut source = ReadPipe::new(data.as_ref());
+        let mut sent_so_far = 0 as usize;
         let mut packetizer = Packetizer::new(4096);
-        assert_eq!(packetizer.write_from(&mut source).unwrap(), 3);
+        let data = b"kek";
+        let mut source = ReadPipe::new(data.as_ref());
+        assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
 
-        let mut buffer = [0u8; 16];
+        let mut buffer = [0u8; 32];
         let packet_size = packetizer.generate(&mut buffer).unwrap();
-        assert_eq!(packet_size, 4 + 4 + 2 + 3);
+        assert_eq!(packet_size, 4 + 4 + 2 + data.len());
+
+        // Packet format:
+        // 0: u32: (24: sequence; 8: num_fragments=NF)
+        // 4: u32 [NF] -- offsets (TODO: varint (masked &32) + delta-coding)
+        // 4 + NF*4: u16 [NF] -- sizes (TODO: varint + delta)
+        // 4 + NF*6: data0 u8[sizes[0]]
+        // 4 + NF*6 + sizes[0]: data1 u8[sizes[1]]
+        // ...
 
         let mut r = Cursor::new(buffer);
         let header = r.read_u32::<LittleEndian>().unwrap();
@@ -201,17 +219,30 @@ mod tests {
 
         let offset = r.read_u32::<LittleEndian>().unwrap();
         let size = r.read_u16::<LittleEndian>().unwrap();
-        assert_eq!(offset, 0);
-        assert_eq!(size, 3);
+        assert_eq!(offset as usize, sent_so_far);
+        assert_eq!(size as usize, data.len());
+        assert_eq!(buffer[r.position() as usize..packet_size], data[..]);
+        sent_so_far += data.len();
 
-        assert_eq!(data[..], buffer[r.position() as usize..packet_size]);
+        let data = b"qeqkekek";
+        let mut source = ReadPipe::new(data.as_ref());
+        assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
 
-        // Packet format:
-        // 0: u32: (24: sequence; 8: num_fragments=NF)
-        // 4: u32 [NF] -- offsets (TODO: varint (masked &32) + delta-coding)
-        // 4 + NF*4: u16 [NF] -- sizes (TODO: varint + delta)
-        // 4 + NF*6: data0 u8[sizes[0]]
-        // 4 + NF*6 + sizes[0]: data1 u8[sizes[1]]
-        // ...
+        let packet_size = packetizer.generate(&mut buffer).unwrap();
+        assert_eq!(packet_size, 4 + 4 + 2 + data.len());
+
+        let mut r = Cursor::new(buffer);
+        let header = r.read_u32::<LittleEndian>().unwrap();
+        let sequence = header >> 8;
+        let num_fragments = header & 0xff;
+        assert_eq!(sequence, 1);
+        assert_eq!(num_fragments, 1);
+
+        let offset = r.read_u32::<LittleEndian>().unwrap();
+        let size = r.read_u16::<LittleEndian>().unwrap();
+        assert_eq!(offset as usize, sent_so_far);
+        //assert_eq!(size as usize, data.len());
+        assert_eq!(buffer[r.position() as usize..packet_size], data[..]);
+        sent_so_far += data.len();
     }
 }
