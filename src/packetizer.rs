@@ -2,8 +2,8 @@ use {
     core::num::Wrapping,
     std::{
         //os::unix::io::AsRawFd,
-        cmp::Ordering,
-        collections::{BTreeSet},
+        // cmp::Ordering,
+        // collections::{BTreeSet},
         io::{Cursor, Read, Write, IoSlice, IoSliceMut},
         ops::{Range, RangeBounds, Bound},
         vec::Vec,
@@ -35,13 +35,13 @@ impl<T: Read> CircRead for ReadPipe<T> {
         let [buf1, buf2] = buffer.get_avail();
         let mut bufs = [IoSliceMut::new(buf1), IoSliceMut::new(buf2)];
         match self.pipe.read_vectored(&mut bufs) {
-            Ok(read) => {
-                buffer.advance_write(read);
-                Ok(read)
-            },
             Ok(0) => {
                 self.readable = false;
                 Ok(0)
+            },
+            Ok(read) => {
+                buffer.advance_write(read);
+                Ok(read)
             },
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 self.readable = false;
@@ -119,7 +119,7 @@ impl Packetizer {
     pub fn write_from(&mut self, source: &mut dyn CircRead) -> std::io::Result<usize> {
         let begin = self.ack_bytes + self.buffer.len() as u64;
         let read = source.read(&mut self.buffer)?;
-        let range = begin .. read as u64;
+        let range = begin .. begin + read as u64;
         println!("{:?}, {:?}", self.fragments, read);
         self.fragments.insert(range);
         println!("{:?}", self.fragments);
@@ -127,6 +127,13 @@ impl Packetizer {
     }
 
     pub fn generate(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.len() < 4 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                format!("Buffer size {} is too small", buf.len())));
+        }
+
+        // TODO: Err() no data to send
+
         let mut left = buf.len() - 4;
         let mut frags = Vec::<Fragment>::new();
 
@@ -171,18 +178,38 @@ impl Packetizer {
             return Ok(0);
         }
 
-        let read = offset - self.ack_bytes;
+        let read = (offset - self.ack_bytes) as usize;
 
         // 2. erase any fragments before offset
         self.fragments.remove(self.ack_bytes..offset);
 
         // 1. move ack_bytes
         self.ack_bytes = offset;
-        Ok(read as usize)
+        self.buffer.advance_read(read);
+        Ok(read)
     }
 
-    pub fn resend(&mut self, offset: u64, size: usize) -> std::io::Result<()> {
-        unimplemented!()
+    pub fn resend(&mut self, offset: u64, size: usize) -> std::io::Result<bool> {
+        // 1. check validity:
+        //      a. offset < self.ack_bytes ... ->
+        let (offset, size) = if offset < self.ack_bytes {
+            let head = self.ack_bytes - offset;
+            if head < size as u64 {
+                return Ok(false);
+            }
+            // FIXME overflow analysis
+            (self.ack_bytes, size - head as usize)
+        } else { (offset, size) };
+
+        //      b. offset + size > bytes to transmit
+        if offset + size as u64 > self.ack_bytes + self.buffer.len() as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                format!("Resend request ({}, {}) exceeds data we might have sent ({}, {})",
+                    offset, size, self.ack_bytes, self.buffer.len())));
+        }
+
+        // 2. insert
+        Ok(self.fragments.insert(offset..offset + size as u64))
     }
 }
 
@@ -190,59 +217,91 @@ impl Packetizer {
 mod tests {
     use super::*;
 
+    fn write_data(packetizer: &mut Packetizer, data: &[u8]) {
+        let mut source = ReadPipe::new(data.as_ref());
+        assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
+    }
+
+    // Packet format:
+    // 0: u32: (24: sequence; 8: num_fragments=NF)
+    // 4: u32 [NF] -- offsets (TODO: varint (masked &32) + delta-coding)
+    // 4 + NF*4: u16 [NF] -- sizes (TODO: varint + delta)
+    // 4 + NF*6: data0 u8[sizes[0]]
+    // 4 + NF*6 + sizes[0]: data1 u8[sizes[1]]
+    // ...
+
+    fn check_single_fragment_data(packetizer: &mut Packetizer, data: &[u8], sent_so_far: &mut usize, seq: u32) {
+        let header_size = 4 + 4 + 2;
+        let mut buffer = vec![0u8; data.len() + header_size]; // TODO: test case w/ buffer size < or > than expected size
+        let packet_size = packetizer.generate(&mut buffer).unwrap();
+        assert_eq!(packet_size, header_size + data.len());
+
+        let mut r = Cursor::new(&buffer);
+        let header = r.read_u32::<LittleEndian>().unwrap();
+        let sequence = header >> 8;
+        let num_fragments = header & 0xff;
+        assert_eq!(sequence, seq);
+        assert_eq!(num_fragments, 1);
+
+        let offset = r.read_u32::<LittleEndian>().unwrap();
+        let size = r.read_u16::<LittleEndian>().unwrap();
+        assert_eq!(offset as usize, *sent_so_far);
+        assert_eq!(size as usize, data.len());
+        assert_eq!(buffer[r.position() as usize..packet_size], data[..]);
+        *sent_so_far += data.len();
+    }
+
+    // TODO tests:
+    // 1. ring buffer full (?! should we grow instead?)
+
     #[test]
     fn test_basic_packet_formation() {
         let mut sent_so_far = 0 as usize;
-        let mut packetizer = Packetizer::new(4096);
-        let data = b"kek";
-        let mut source = ReadPipe::new(data.as_ref());
-        assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
+        let mut packetizer = Packetizer::new(32);
 
-        let mut buffer = [0u8; 32];
-        let packet_size = packetizer.generate(&mut buffer).unwrap();
-        assert_eq!(packet_size, 4 + 4 + 2 + data.len());
+        let data = &b"keque...."[..];
+        write_data(&mut packetizer, &data[..]);
+        check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0);
 
-        // Packet format:
-        // 0: u32: (24: sequence; 8: num_fragments=NF)
-        // 4: u32 [NF] -- offsets (TODO: varint (masked &32) + delta-coding)
-        // 4 + NF*4: u16 [NF] -- sizes (TODO: varint + delta)
-        // 4 + NF*6: data0 u8[sizes[0]]
-        // 4 + NF*6 + sizes[0]: data1 u8[sizes[1]]
-        // ...
+        let data = &b"qeqkekek"[..];
+        write_data(&mut packetizer, &data[..]);
+        check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1);
+    }
 
-        let mut r = Cursor::new(buffer);
-        let header = r.read_u32::<LittleEndian>().unwrap();
-        let sequence = header >> 8;
-        let num_fragments = header & 0xff;
-        assert_eq!(sequence, 0);
-        assert_eq!(num_fragments, 1);
+    #[test]
+    fn test_basic_packet_formation_with_consume() {
+        let mut sent_so_far = 0 as usize;
+        let mut packetizer = Packetizer::new(16);
 
-        let offset = r.read_u32::<LittleEndian>().unwrap();
-        let size = r.read_u16::<LittleEndian>().unwrap();
-        assert_eq!(offset as usize, sent_so_far);
-        assert_eq!(size as usize, data.len());
-        assert_eq!(buffer[r.position() as usize..packet_size], data[..]);
-        sent_so_far += data.len();
+        let data = &b"keque...."[..];
+        write_data(&mut packetizer, &data[..]);
+        check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0);
 
-        let data = b"qeqkekek";
-        let mut source = ReadPipe::new(data.as_ref());
-        assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
+        packetizer.confirm_read(8);
 
-        let packet_size = packetizer.generate(&mut buffer).unwrap();
-        assert_eq!(packet_size, 4 + 4 + 2 + data.len());
+        let data = &b"qeqkekek"[..];
+        write_data(&mut packetizer, &data[..]);
+        check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1);
+    }
 
-        let mut r = Cursor::new(buffer);
-        let header = r.read_u32::<LittleEndian>().unwrap();
-        let sequence = header >> 8;
-        let num_fragments = header & 0xff;
-        assert_eq!(sequence, 1);
-        assert_eq!(num_fragments, 1);
+    #[test]
+    fn test_basic_packet_resend() {
+        let mut sent_so_far = 0 as usize;
+        let mut packetizer = Packetizer::new(16);
 
-        let offset = r.read_u32::<LittleEndian>().unwrap();
-        let size = r.read_u16::<LittleEndian>().unwrap();
-        assert_eq!(offset as usize, sent_so_far);
-        //assert_eq!(size as usize, data.len());
-        assert_eq!(buffer[r.position() as usize..packet_size], data[..]);
-        sent_so_far += data.len();
+        let data = &b"keque...."[..];
+        write_data(&mut packetizer, &data[..]);
+        check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0);
+
+        packetizer.resend(3, 4).unwrap();
+        sent_so_far = 3;
+        check_single_fragment_data(&mut packetizer, &data[3..7], &mut sent_so_far, 1);
+
+        packetizer.confirm_read(8);
+
+        sent_so_far = data.len();
+        let data = &b"qeqkekek"[..];
+        write_data(&mut packetizer, &data[..]);
+        check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 2);
     }
 }

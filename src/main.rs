@@ -99,6 +99,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
             match event.token() {
                 SOCKET => {
+                    let mut buf = [0u8; 1400];
+                    let size = to_send.generate(&mut buf).unwrap();
+                    socket.send(&buf[0..size]).unwrap(); // FIXME handle errors
                 },
                 _ => {},
             }
