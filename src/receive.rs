@@ -1,7 +1,6 @@
 use {
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
-	ranges::{GenericRange, Ranges},
 	std::{
 		io::{Cursor, Read, Write},
 		ops::{Bound, Range, RangeBounds},
