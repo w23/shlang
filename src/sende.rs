@@ -131,7 +131,26 @@ impl Fragments {
 	}
 
 	fn confirm(&mut self, seq: u32) -> Result<u32, FragmentError> {
-		unimplemented!()
+		// assumption: seq can't be too old to wrap
+		let age = match self.seq.age(seq) {
+			None => {
+				return Err(FragmentError::InvalidOffset {
+					head: self.seq.into(),
+				})
+			}
+			Some(age) => age - 1,
+		} as usize;
+
+		// TODO: consider making Fragment::sent triple state (NotSentEver, Sent, PlsResend)
+		// and check whether this confirm is valid for all relevant fragments
+
+		if age >= self.fragments.len() {
+			return Ok(0);
+		}
+
+		let to_remove = self.fragments.len() - age;
+		self.fragments.truncate(age);
+		Ok(to_remove as u32)
 	}
 
 	// mask lowest bit == start_seq, (mask>>1)&1 == start_seq + 1
@@ -168,75 +187,6 @@ impl Fragments {
 		}
 
 		Ok(ret_mask)
-	}
-}
-
-#[cfg(test)]
-mod fragment_tests {
-	use super::*;
-
-	#[test]
-	fn basic_insert_send() {
-		let mut fragments = Fragments::new();
-		assert_eq!(fragments.write_chunk(337), 2);
-		let mut iter = fragments.iter_unsent_mut();
-		assert_eq!(
-			*iter.next().unwrap(),
-			Fragment {
-				offset: 0,
-				size: 255,
-				sent: false
-			}
-		);
-		assert_eq!(
-			*iter.next().unwrap(),
-			Fragment {
-				offset: 256,
-				size: 80,
-				sent: false
-			}
-		);
-
-		let mut iter = fragments.iter_unsent_mut();
-		let mut frag = iter.next().unwrap();
-		assert_eq!(
-			*frag,
-			Fragment {
-				offset: 0,
-				size: 255,
-				sent: false
-			}
-		);
-		frag.sent = true;
-		assert_eq!(
-			*iter.next().unwrap(),
-			Fragment {
-				offset: 256,
-				size: 80,
-				sent: false
-			}
-		);
-		let mut iter = fragments.iter_unsent_mut();
-		assert_eq!(
-			*iter.next().unwrap(),
-			Fragment {
-				offset: 256,
-				size: 80,
-				sent: false
-			}
-		);
-
-		assert_eq!(fragments.mark_for_send(0, 1).unwrap(), 1);
-		let mut iter = fragments.iter_unsent_mut();
-		let mut frag = iter.next().unwrap();
-		assert_eq!(
-			*frag,
-			Fragment {
-				offset: 0,
-				size: 255,
-				sent: false
-			}
-		);
 	}
 }
 
@@ -395,6 +345,116 @@ impl Sender {
 	// 		// 2. insert
 	// 		Ok(self.fragments.insert(offset..offset + size as u64))
 	// 	}
+}
+
+#[cfg(test)]
+mod fragment_tests {
+	use super::*;
+
+	#[test]
+	fn basic_insert_send() {
+		let mut fragments = Fragments::new();
+		assert_eq!(fragments.write_chunk(337), 2);
+		let mut iter = fragments.iter_unsent_mut();
+		assert_eq!(
+			*iter.next().unwrap(),
+			Fragment {
+				offset: 0,
+				size: 255,
+				sent: false
+			}
+		);
+		assert_eq!(
+			*iter.next().unwrap(),
+			Fragment {
+				offset: 256,
+				size: 80,
+				sent: false
+			}
+		);
+
+		let mut iter = fragments.iter_unsent_mut();
+		let mut frag = iter.next().unwrap();
+		assert_eq!(
+			*frag,
+			Fragment {
+				offset: 0,
+				size: 255,
+				sent: false
+			}
+		);
+		frag.sent = true;
+		assert_eq!(
+			*iter.next().unwrap(),
+			Fragment {
+				offset: 256,
+				size: 80,
+				sent: false
+			}
+		);
+		let mut iter = fragments.iter_unsent_mut();
+		assert_eq!(
+			*iter.next().unwrap(),
+			Fragment {
+				offset: 256,
+				size: 80,
+				sent: false
+			}
+		);
+
+		assert_eq!(fragments.mark_for_send(0, 1).unwrap(), 1);
+		let mut iter = fragments.iter_unsent_mut();
+		let frag = iter.next().unwrap();
+		assert_eq!(
+			*frag,
+			Fragment {
+				offset: 0,
+				size: 255,
+				sent: false
+			}
+		);
+	}
+
+	#[test]
+	fn basic_confirm_one() {
+		let mut fragments = Fragments::new();
+		assert_eq!(fragments.write_chunk(1), 1);
+		assert_eq!(fragments.confirm(0).unwrap(), 1);
+		assert!(fragments.iter_unsent_mut().next().is_none());
+	}
+
+	#[test]
+	fn basic_confirm_few() {
+		let mut fragments = Fragments::new();
+		assert_eq!(fragments.write_chunk(1337), 6);
+		assert_eq!(fragments.confirm(2).unwrap(), 3);
+		let mut iter = fragments.iter_unsent_mut();
+		assert_eq!(
+			*iter.next().unwrap(),
+			Fragment {
+				offset: 3 * 256,
+				size: 255,
+				sent: false
+			}
+		);
+		assert_eq!(
+			*iter.next().unwrap(),
+			Fragment {
+				offset: 4 * 256,
+				size: 255,
+				sent: false
+			}
+		);
+		assert_eq!(
+			*iter.next().unwrap(),
+			Fragment {
+				offset: 5 * 256,
+				size: (1337 - 5 * 256) as u8 - 1,
+				sent: false
+			}
+		);
+		assert!(iter.next().is_none());
+	}
 }
 //
 // #[cfg(test)]
