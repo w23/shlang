@@ -1,49 +1,249 @@
 use {
+	crate::sequence::Sequence,
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
 	std::{
+		collections::VecDeque,
 		io::{Cursor, Read, Write},
-		ops::{Bound, Range, RangeBounds},
 		time::Instant,
-		vec::Vec,
 	},
+	thiserror::Error,
 };
 
-use crate::sequence::Sequence;
-
-struct MissingFragment {
-	offset: u64,
-	size: usize,
-	expected_time: Instant,
+#[derive(Error, Debug, Clone)]
+enum FragmentError {
+	#[error("Fragment sequence is too old, expected newer than {oldest_sequence:?}")]
+	TooOld { oldest_sequence: u32 },
+	#[error("Fragment already received")]
+	AlreadyReceived,
+	#[error("Fragment already received and has size that differs {known_size:?}")]
+	Inconsistent { known_size: u8 },
 }
 
-struct FragmentsIterator {}
+enum Fragment {
+	Unknown {
+		expected_time: Instant,
+	},
+	Received {
+		data_block_index: u32,
+		size: u8, // size - 1
+	},
+}
 
-impl Iterator for FragmentsIterator {
-	type Item = MissingFragment;
+#[derive(Eq, PartialEq, Debug, Clone)]
+struct ReceivedFragment {
+	size: usize, // real size, not - 1
+	data_block_index: u32,
+	sequence: u32,
+}
 
-	fn next(&mut self) -> Option<MissingFragment> {
-		unimplemented!()
+struct ReceivedFragmentIterator<'a> {
+	fragments: std::iter::Rev<std::collections::vec_deque::Iter<'a, Fragment>>,
+	sequence: u32,
+}
+
+impl<'a> ReceivedFragmentIterator<'a> {
+	fn new(fragments: &'a Fragments) -> Self {
+		Self {
+			fragments: fragments.fragments.iter().rev(),
+			// FIXME wrapping
+			sequence: fragments.next_expected_sequence - fragments.fragments.len() as u32,
+		}
+	}
+}
+
+impl<'a> Iterator for ReceivedFragmentIterator<'a> {
+	type Item = ReceivedFragment;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		match self.fragments.next() {
+			None => None,
+			Some(Fragment::Unknown { .. }) => None,
+			Some(Fragment::Received {
+				size: size,
+				data_block_index: data_block_index,
+			}) => {
+				let sequence = self.sequence;
+				self.sequence += 1;
+				Some(ReceivedFragment {
+					size: *size as usize + 1,
+					data_block_index: *data_block_index,
+					sequence,
+				})
+			}
+		}
 	}
 }
 
 struct Fragments {
-	// ... ???
+	fragments: VecDeque<Fragment>,
+	next_expected_sequence: u32, // FIXME wrapping
 }
 
 impl Fragments {
 	fn new() -> Fragments {
+		Fragments {
+			fragments: VecDeque::new(),
+			next_expected_sequence: 0,
+		}
+	}
+
+	// Register fragment with sequence number, size, received at timestamp
+	fn insert(
+		&mut self,
+		seq: u32,
+		data_block_index: u32,
+		size: u8, // size - 1
+		timestamp: Instant,
+	) -> Result<(), FragmentError> {
+		// FIXME handle wrapping
+		let oldest_sequence = self.next_expected_sequence - self.fragments.len() as u32;
+		if oldest_sequence > seq {
+			return Err(FragmentError::TooOld { oldest_sequence });
+		}
+
+		// FIXME wrapping
+		if seq < self.next_expected_sequence {
+			let index = self.fragments.len() - (self.next_expected_sequence - seq - 1) as usize;
+			println!(
+				"len={} next={} seq={}, index={}",
+				self.fragments.len(),
+				self.next_expected_sequence,
+				seq,
+				index
+			);
+			return match &mut self.fragments[index] {
+				Fragment::Received {
+					size: known_size, ..
+				} => {
+					if size != *known_size {
+						Err(FragmentError::Inconsistent {
+							known_size: *known_size,
+						})
+					} else {
+						Err(FragmentError::AlreadyReceived)
+					}
+				}
+				frag => {
+					*frag = Fragment::Received {
+						size,
+						data_block_index,
+					};
+					Ok(())
+				}
+			};
+		}
+
+		// FIXME wrapping
+		let to_create = seq - self.next_expected_sequence;
+		// TODO OchenVecDeque: we have to insert to front, because VecDeque doesn't
+		// treat front and back equally: there's a way to delete items from back (truncate),
+		// but no such operation for front.
+		for _ in 0..to_create {
+			self.fragments.push_front(Fragment::Unknown {
+				expected_time: timestamp,
+			});
+			self.next_expected_sequence += 1;
+		}
+
+		self.fragments.push_front(Fragment::Received {
+			size,
+			data_block_index,
+		});
+		self.next_expected_sequence += 1;
+		Ok(())
+	}
+
+	// Consecutive fragments until first not received
+	fn iter_received(&self) -> ReceivedFragmentIterator {
+		ReceivedFragmentIterator::new(&self)
+	}
+
+	fn consume(&mut self, sequence: u32) -> Result<u32, FragmentError> {
 		unimplemented!()
 	}
 
-	// Receive data at offset and with size size
-	fn insert(&mut self, offset: u64, size: usize, timestamp: Instant) -> Option<usize> {
-		unimplemented!()
+	// fn iter_missing_mut(&mut self) -> FragmentsMissingIteratorMut {
+	// 	unimplemented!()
+	// }
+}
+
+#[cfg(test)]
+mod fragment_tests {
+	use super::*;
+
+	#[test]
+	fn basic_insert_received() {
+		let now = Instant::now();
+		let mut fragments = Fragments::new();
+		fragments.insert(0, 1337, 255, now).unwrap();
+		let mut it = fragments.iter_received();
+		assert_eq!(
+			it.next().unwrap(),
+			ReceivedFragment {
+				size: 256,
+				data_block_index: 1337,
+				sequence: 0
+			}
+		);
+		assert!(it.next().is_none());
+
+		fragments.insert(1, 23, 100, now).unwrap();
+		let mut it = fragments.iter_received();
+		assert_eq!(
+			it.next().unwrap(),
+			ReceivedFragment {
+				size: 256,
+				data_block_index: 1337,
+				sequence: 0
+			}
+		);
+		assert_eq!(
+			it.next().unwrap(),
+			ReceivedFragment {
+				size: 101,
+				data_block_index: 23,
+				sequence: 1
+			}
+		);
+		assert!(it.next().is_none());
 	}
 
-	fn missing(&self) -> FragmentsIterator {
-		unimplemented!()
+	#[test]
+	fn basic_insert_out_of_order() {
+		let now = Instant::now();
+		let mut fragments = Fragments::new();
+		fragments.insert(1, 1337, 255, now).unwrap();
+		let mut it = fragments.iter_received();
+		assert!(it.next().is_none());
+
+		fragments.insert(0, 23, 100, now).unwrap();
+		let mut it = fragments.iter_received();
+		assert_eq!(
+			it.next().unwrap(),
+			ReceivedFragment {
+				size: 101,
+				data_block_index: 23,
+				sequence: 0
+			}
+		);
+		assert_eq!(
+			it.next().unwrap(),
+			ReceivedFragment {
+				size: 256,
+				data_block_index: 1337,
+				sequence: 1
+			}
+		);
+		assert!(it.next().is_none());
 	}
+
+	// TODO:
+	// 1. 3x fragments insert errors
+	// 2.a insert out of order, confirm zero
+	// 2.b --//-- insert order, confirm first
+	// 3. insert, confirm
+	// 4. insert, insert, confirm
 }
 
 pub struct Receiver {
@@ -79,7 +279,7 @@ impl Receiver {
 
 			let offset = offset as u64; // FIXME proper mapping
 
-			self.fragments.insert(offset, size as usize, now);
+			// FIXME self.fragments.insert(offset, size as usize, now);
 			// 1. read data into buffer
 			// 2. do we need to prepare hint that it became readable
 		}
@@ -88,7 +288,7 @@ impl Receiver {
 	}
 
 	pub fn gen_feedback_packet(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		for missing in self.fragments.missing() {}
+		//for missing in self.fragments.missing() {}
 		unimplemented!()
 	}
 }

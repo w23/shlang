@@ -2,14 +2,14 @@ use {
 	crate::sequence::Sequence,
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
-	core::num::Wrapping,
+	//core::num::Wrapping,
 	std::{
 		collections::VecDeque,
-		error::Error,
-		fmt,
-		io::{Cursor, IoSlice, IoSliceMut, Read, Write},
-		ops::{Bound, RangeBounds},
-		vec::Vec,
+		//error::Error,
+		//fmt,
+		io::{Cursor, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
+		//ops::{Bound, RangeBounds},
+		//vec::Vec,
 	},
 	thiserror::Error,
 };
@@ -57,31 +57,41 @@ impl<T: Read> CircRead for ReadPipe<T> {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct Fragment {
-	offset: u32,
-	size: u8, // one less: 0-255 -> 1-256
-	sent: bool,
-}
-
 #[derive(Error, Debug, Clone)]
-enum FragmentError {
+pub enum FragmentError {
 	#[error("Offset too large, must be less than {head:?}")]
 	InvalidOffset { head: u32 },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct Fragment {
+	offset: u32, // FIXME u64
+	size: u8,    // one less: 0-255 -> 1-256
+	sent: bool,
+}
+
+struct FragmentIteratedMut<'a> {
+	fragment: &'a mut Fragment,
+	seq: u32,
+}
+
 struct FragmentIterator<'a> {
 	fragments: std::iter::Rev<std::collections::vec_deque::IterMut<'a, Fragment>>,
+	seq: u32,
 }
 
 impl<'a> Iterator for FragmentIterator<'a> {
-	type Item = &'a mut Fragment;
+	type Item = FragmentIteratedMut<'a>;
 
-	fn next(&mut self) -> Option<&'a mut Fragment> {
+	fn next(&mut self) -> Option<FragmentIteratedMut<'a>> {
 		for frag in &mut self.fragments {
 			if !frag.sent {
-				return Some(frag);
+				return Some(FragmentIteratedMut::<'a> {
+					fragment: frag,
+					seq: self.seq,
+				});
 			}
+			self.seq = self.seq.wrapping_add(1);
 		}
 
 		None
@@ -91,6 +101,7 @@ impl<'a> Iterator for FragmentIterator<'a> {
 struct Fragments {
 	fragments: VecDeque<Fragment>,
 	seq: Sequence, // next fragment sequence number
+	               // TODO deque of indexes to fragments to send instead of 'sent' field
 }
 
 impl Fragments {
@@ -125,12 +136,15 @@ impl Fragments {
 	}
 
 	fn iter_unsent_mut(&mut self) -> FragmentIterator {
+		let seq: u32 = self.seq.into();
+		let seq = seq.wrapping_sub(self.fragments.len() as u32);
 		FragmentIterator {
 			fragments: self.fragments.iter_mut().rev(),
+			seq,
 		}
 	}
 
-	fn confirm(&mut self, seq: u32) -> Result<u32, FragmentError> {
+	fn confirm(&mut self, seq: u32) -> Result<usize, FragmentError> {
 		// assumption: seq can't be too old to wrap
 		let age = match self.seq.age(seq) {
 			None => {
@@ -141,16 +155,21 @@ impl Fragments {
 			Some(age) => age - 1,
 		} as usize;
 
-		// TODO: consider making Fragment::sent triple state (NotSentEver, Sent, PlsResend)
-		// and check whether this confirm is valid for all relevant fragments
-
 		if age >= self.fragments.len() {
 			return Ok(0);
 		}
 
 		let to_remove = self.fragments.len() - age;
+
+		let mut size = 0;
+		for fragment in self.fragments.iter().rev().take(to_remove) {
+			// TODO: consider making Fragment::sent triple state (NotSentEver, Sent, PlsResend)
+			// and check whether this confirm is valid for all relevant fragments
+			size += fragment.size as usize + 1;
+		}
+
 		self.fragments.truncate(age);
-		Ok(to_remove as u32)
+		Ok(size)
 	}
 
 	// mask lowest bit == start_seq, (mask>>1)&1 == start_seq + 1
@@ -190,103 +209,118 @@ impl Fragments {
 	}
 }
 
+#[derive(Error, Debug, Clone)]
+pub enum SenderError {
+	#[error("Buffer is too small")]
+	BufferTooSmall,
+}
+
 pub struct Sender {
 	buffer: CircBuf,
+	fragments: Fragments,
+	consumed_offset: u32, // FIXME u64
 	packet_seq: Sequence,
 }
 
-// fn write_from_offset<T: Write>(
-// 	buffer: &mut CircBuf,
-// 	offset: usize,
-// 	dest: &mut T,
-// ) -> std::io::Result<usize> {
-// 	if buffer.len() == 0 {
-// 		return Ok(0);
-// 	}
-// 	let bufs = buffer.get_bytes();
-// 	let len0 = bufs[0].len();
-// 	let len1 = bufs[1].len();
-// 	let off1 = std::cmp::min(if offset < len0 { 0 } else { offset - len0 }, len1);
-// 	let bufs = [
-// 		IoSlice::new(&bufs[0][std::cmp::min(offset, len0)..len0]),
-// 		IoSlice::new(&bufs[1][off1..len1]),
-// 	];
-// 	dest.write_vectored(&bufs)
-// }
-//
+fn write_from_offset<T: Write>(
+	buffer: &mut CircBuf,
+	offset: usize,
+	dest: &mut T,
+) -> std::io::Result<usize> {
+	if buffer.len() == 0 {
+		return Ok(0);
+	}
+	let bufs = buffer.get_bytes();
+	let len0 = bufs[0].len();
+	let len1 = bufs[1].len();
+	let off1 = std::cmp::min(if offset < len0 { 0 } else { offset - len0 }, len1);
+	let bufs = [
+		IoSlice::new(&bufs[0][std::cmp::min(offset, len0)..len0]),
+		IoSlice::new(&bufs[1][off1..len1]),
+	];
+	dest.write_vectored(&bufs)
+}
+
 impl Sender {
 	pub fn new(buffer_capacity: usize) -> Sender {
 		Sender {
 			buffer: CircBuf::with_capacity(buffer_capacity).unwrap(),
+			fragments: Fragments::new(),
+			consumed_offset: 0,
 			packet_seq: Sequence::new(),
-			// 			fragments: Ranges::new(),
-			// 			ack_bytes: 0,
 		}
 	}
-	//
+
 	pub fn write_from(&mut self, source: &mut dyn CircRead) -> std::io::Result<usize> {
-		unimplemented!()
+		let read = source.read(&mut self.buffer)?;
+		if read > 0 {
+			self.fragments.write_chunk(read);
+		}
+		Ok(read)
 	}
-	// 		let begin = self.ack_bytes + self.buffer.len() as u64;
-	// 		let read = source.read(&mut self.buffer)?;
-	// 		let range = begin..begin + read as u64;
-	// 		println!("{:?}, {:?}", self.fragments, read);
-	// 		self.fragments.insert(range);
-	// 		println!("{:?}", self.fragments);
-	// 		Ok(read)
-	// 	}
-	//
-	pub fn generate(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		unimplemented!()
+
+	pub fn generate(&mut self, buf: &mut [u8]) -> Result<usize, SenderError> {
+		// chunks[N]
+		// chunk[0..N-2]: u8 size-1, u8 bytes[size]
+		// chunk[N-1]: last chunk is metadata:
+		//	- u32 packet_sequence
+		//	- fragment_ids u32[N-1]
+
+		if buf.len() < 5 {
+			return Err(SenderError::BufferTooSmall);
+		}
+
+		let mut fragment_ids = [0u32; 16];
+		let mut fragments = 0;
+		let mut left = buf.len() - 5;
+		let mut wr = Cursor::new(buf);
+		for it in self.fragments.iter_unsent_mut() {
+			if left < 5 || fragments == fragment_ids.len() || fragments == 63 {
+				break;
+			}
+
+			// FIXME: perf. will almost always traverse ALL fragments. need an unsent/order by size index
+			if left - 5 < (it.fragment.size + 1) as usize {
+				continue;
+			}
+
+			wr.write_u8(it.fragment.size).unwrap();
+			// FIXME handle wrapping: both offsets are wrapped u32 in a bigger stream
+			assert!(self.consumed_offset <= it.fragment.offset);
+			let offset = it.fragment.offset - self.consumed_offset;
+			let cursor_offset = wr.position() as usize;
+			let mut dest =
+				&mut wr.get_mut()[cursor_offset..cursor_offset + it.fragment.size as usize + 1];
+			write_from_offset(&mut self.buffer, offset as usize, &mut dest).unwrap();
+			wr.set_position((cursor_offset + it.fragment.size as usize + 1) as u64);
+			it.fragment.sent = true;
+			fragment_ids[fragments] = it.seq;
+			fragments += 1;
+			left -= 5 + it.fragment.size as usize + 1;
+		}
+
+		// FIXME generate header|tail
+		let tail_size = (fragments + 1) * 4;
+		assert!(tail_size <= 256);
+		wr.write_u8((tail_size - 1) as u8).unwrap();
+		wr.write_u32::<LittleEndian>(self.packet_seq.next())
+			.unwrap();
+		for i in 0..fragments {
+			wr.write_u32::<LittleEndian>(fragment_ids[i]).unwrap();
+		}
+		Ok(wr.position() as usize)
 	}
-	// 		if buf.len() < 4 {
-	// 			return Err(std::io::Error::new(
-	// 				std::io::ErrorKind::InvalidInput,
-	// 				format!("Buffer size {} is too small", buf.len()),
-	// 			));
-	// 		}
-	//
-	// 		// TODO: Err() no data to send
-	//
-	// 		let mut left = buf.len() - 4;
-	// 		let mut frags = Vec::<Fragment>::new();
-	//
-	// 		for fragment in self.fragments.as_slice() {
-	// 			if left < 7 || frags.len() > 15 {
-	// 				break;
-	// 			}
-	// 			left -= 6; // offset + size
-	//
-	// 			let fragment: Fragment = fragment.into();
-	// 			frags.push(fragment.clone());
-	// 			left -= std::cmp::min(left, fragment.size);
-	// 		}
-	//
-	// 		let sequence = self.packet_seq.next();
-	// 		let header = (sequence << 8) | frags.len() as u32;
-	// 		let buf_size = buf.len();
-	// 		let mut wr = Cursor::new(buf);
-	// 		wr.write_u32::<LittleEndian>(header).unwrap();
-	//
-	// 		for frag in &frags {
-	// 			let left = buf_size - wr.position() as usize;
-	// 			assert!(left > 0);
-	// 			wr.write_u32::<LittleEndian>((frag.offset & 0xffffffff) as u32)
-	// 				.unwrap();
-	// 			let to_write = std::cmp::min(left, frag.size);
-	// 			assert!(to_write < 65535);
-	// 			wr.write_u16::<LittleEndian>(to_write as u16).unwrap();
-	// 			let offset = (frag.offset - self.ack_bytes) as usize;
-	// 			write_from_offset(&mut self.buffer, offset, &mut wr).unwrap();
-	// 			self
-	// 				.fragments
-	// 				.remove(frag.offset..frag.offset + frag.size as u64);
-	// 		}
-	//
-	// 		Ok(wr.position() as usize)
-	// 	}
-	//
-	// 	pub fn confirm_read(&mut self, offset: u64) -> std::io::Result<usize> {
+
+	pub fn confirm_read(&mut self, fragment_seq: u32) -> Result<usize, FragmentError> {
+		let advance = self.fragments.confirm(fragment_seq)?;
+		self.buffer.advance_read(advance);
+		Ok(advance)
+	}
+
+	fn mark_for_send(&mut self, start_seq: u32, mask: u64) -> Result<u64, FragmentError> {
+		self.fragments.mark_for_send(start_seq, mask)
+	}
+
 	// 		// 3. offset is correct < bytes sent
 	// 		if offset > self.ack_bytes + self.buffer.len() as u64 {
 	// 			return Err(std::io::Error::new(
@@ -356,8 +390,9 @@ mod fragment_tests {
 		let mut fragments = Fragments::new();
 		assert_eq!(fragments.write_chunk(337), 2);
 		let mut iter = fragments.iter_unsent_mut();
+		// TODO seq
 		assert_eq!(
-			*iter.next().unwrap(),
+			*iter.next().unwrap().fragment,
 			Fragment {
 				offset: 0,
 				size: 255,
@@ -365,7 +400,7 @@ mod fragment_tests {
 			}
 		);
 		assert_eq!(
-			*iter.next().unwrap(),
+			*iter.next().unwrap().fragment,
 			Fragment {
 				offset: 256,
 				size: 80,
@@ -374,7 +409,7 @@ mod fragment_tests {
 		);
 
 		let mut iter = fragments.iter_unsent_mut();
-		let mut frag = iter.next().unwrap();
+		let mut frag = iter.next().unwrap().fragment;
 		assert_eq!(
 			*frag,
 			Fragment {
@@ -385,7 +420,7 @@ mod fragment_tests {
 		);
 		frag.sent = true;
 		assert_eq!(
-			*iter.next().unwrap(),
+			*iter.next().unwrap().fragment,
 			Fragment {
 				offset: 256,
 				size: 80,
@@ -394,7 +429,7 @@ mod fragment_tests {
 		);
 		let mut iter = fragments.iter_unsent_mut();
 		assert_eq!(
-			*iter.next().unwrap(),
+			*iter.next().unwrap().fragment,
 			Fragment {
 				offset: 256,
 				size: 80,
@@ -404,7 +439,7 @@ mod fragment_tests {
 
 		assert_eq!(fragments.mark_for_send(0, 1).unwrap(), 1);
 		let mut iter = fragments.iter_unsent_mut();
-		let frag = iter.next().unwrap();
+		let frag = iter.next().unwrap().fragment;
 		assert_eq!(
 			*frag,
 			Fragment {
@@ -418,8 +453,8 @@ mod fragment_tests {
 	#[test]
 	fn basic_confirm_one() {
 		let mut fragments = Fragments::new();
-		assert_eq!(fragments.write_chunk(1), 1);
-		assert_eq!(fragments.confirm(0).unwrap(), 1);
+		assert_eq!(fragments.write_chunk(250), 1);
+		assert_eq!(fragments.confirm(0).unwrap(), 250);
 		assert!(fragments.iter_unsent_mut().next().is_none());
 	}
 
@@ -427,10 +462,10 @@ mod fragment_tests {
 	fn basic_confirm_few() {
 		let mut fragments = Fragments::new();
 		assert_eq!(fragments.write_chunk(1337), 6);
-		assert_eq!(fragments.confirm(2).unwrap(), 3);
+		assert_eq!(fragments.confirm(2).unwrap(), 256 * 3);
 		let mut iter = fragments.iter_unsent_mut();
 		assert_eq!(
-			*iter.next().unwrap(),
+			*iter.next().unwrap().fragment,
 			Fragment {
 				offset: 3 * 256,
 				size: 255,
@@ -438,7 +473,7 @@ mod fragment_tests {
 			}
 		);
 		assert_eq!(
-			*iter.next().unwrap(),
+			*iter.next().unwrap().fragment,
 			Fragment {
 				offset: 4 * 256,
 				size: 255,
@@ -446,7 +481,7 @@ mod fragment_tests {
 			}
 		);
 		assert_eq!(
-			*iter.next().unwrap(),
+			*iter.next().unwrap().fragment,
 			Fragment {
 				offset: 5 * 256,
 				size: (1337 - 5 * 256) as u8 - 1,
@@ -455,102 +490,103 @@ mod fragment_tests {
 		);
 		assert!(iter.next().is_none());
 	}
+
+	// FIXME add tests for errors
 }
-//
-// #[cfg(test)]
-// mod tests {
-// 	use super::*;
-//
-// 	fn write_data(packetizer: &mut Sender, data: &[u8]) {
-// 		let mut source = ReadPipe::new(data.as_ref());
-// 		assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
-// 	}
-//
-// 	// Packet format:
-// 	// 0: u32: (24: sequence; 8: num_fragments=NF)
-// 	// 4: u32 [NF] -- offsets (TODO: varint (masked &32) + delta-coding)
-// 	// 4 + NF*4: u16 [NF] -- sizes (TODO: varint + delta)
-// 	// 4 + NF*6: data0 u8[sizes[0]]
-// 	// 4 + NF*6 + sizes[0]: data1 u8[sizes[1]]
-// 	// ...
-//
-// 	fn check_single_fragment_data(
-// 		packetizer: &mut Sender,
-// 		data: &[u8],
-// 		sent_so_far: &mut usize,
-// 		seq: u32,
-// 	) {
-// 		let header_size = 4 + 4 + 2;
-// 		let mut buffer = vec![0u8; data.len() + header_size]; // TODO: test case w/ buffer size < or > than expected size
-// 		let packet_size = packetizer.generate(&mut buffer).unwrap();
-// 		assert_eq!(packet_size, header_size + data.len());
-//
-// 		let mut r = Cursor::new(&buffer);
-// 		let header = r.read_u32::<LittleEndian>().unwrap();
-// 		let sequence = header >> 8;
-// 		let num_fragments = header & 0xff;
-// 		assert_eq!(sequence, seq);
-// 		assert_eq!(num_fragments, 1);
-//
-// 		let offset = r.read_u32::<LittleEndian>().unwrap();
-// 		let size = r.read_u16::<LittleEndian>().unwrap();
-// 		assert_eq!(offset as usize, *sent_so_far);
-// 		assert_eq!(size as usize, data.len());
-// 		assert_eq!(buffer[r.position() as usize..packet_size], data[..]);
-// 		*sent_so_far += data.len();
-// 	}
-//
-// 	// TODO tests:
-// 	// 1. ring buffer full (?! should we grow instead?)
-//
-// 	#[test]
-// 	fn test_basic_packet_formation() {
-// 		let mut sent_so_far = 0 as usize;
-// 		let mut packetizer = Sender::new(32);
-//
-// 		let data = &b"keque...."[..];
-// 		write_data(&mut packetizer, &data[..]);
-// 		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0);
-//
-// 		let data = &b"qeqkekek"[..];
-// 		write_data(&mut packetizer, &data[..]);
-// 		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1);
-// 	}
-//
-// 	#[test]
-// 	fn test_basic_packet_formation_with_consume() {
-// 		let mut sent_so_far = 0 as usize;
-// 		let mut packetizer = Sender::new(16);
-//
-// 		let data = &b"keque...."[..];
-// 		write_data(&mut packetizer, &data[..]);
-// 		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0);
-//
-// 		packetizer.confirm_read(8);
-//
-// 		let data = &b"qeqkekek"[..];
-// 		write_data(&mut packetizer, &data[..]);
-// 		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1);
-// 	}
-//
-// 	#[test]
-// 	fn test_basic_packet_resend() {
-// 		let mut sent_so_far = 0 as usize;
-// 		let mut packetizer = Sender::new(16);
-//
-// 		let data = &b"keque...."[..];
-// 		write_data(&mut packetizer, &data[..]);
-// 		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0);
-//
-// 		packetizer.resend(3, 4).unwrap();
-// 		sent_so_far = 3;
-// 		check_single_fragment_data(&mut packetizer, &data[3..7], &mut sent_so_far, 1);
-//
-// 		packetizer.confirm_read(8);
-//
-// 		sent_so_far = data.len();
-// 		let data = &b"qeqkekek"[..];
-// 		write_data(&mut packetizer, &data[..]);
-// 		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 2);
-// 	}
-// }
+
+#[cfg(test)]
+mod packet_tests {
+	use super::*;
+
+	fn write_data(packetizer: &mut Sender, data: &[u8]) {
+		let mut source = ReadPipe::new(data.as_ref());
+		assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
+	}
+
+	fn check_single_fragment_data(
+		packetizer: &mut Sender,
+		data: &[u8],
+		sent_so_far: &mut usize,
+		seq: u32,
+		frag_id: u32,
+	) {
+		assert!(data.len() <= 256);
+		let header_size = 1 + 4 + 4 + 1;
+		let mut buffer = vec![0u8; data.len() + header_size];
+		let packet_size = packetizer.generate(&mut buffer).unwrap();
+		assert_eq!(packet_size, header_size + data.len());
+
+		println!("{:?}", &buffer);
+
+		let mut r = Cursor::new(&buffer);
+		let chunk_size = r.read_u8().unwrap() as usize + 1;
+		assert_eq!(chunk_size, data.len());
+		assert_eq!(
+			buffer[r.position() as usize..r.position() as usize + chunk_size],
+			data[..]
+		);
+
+		r.seek(SeekFrom::Current(chunk_size as i64)).unwrap();
+		let tail_size = r.read_u8().unwrap();
+		assert_eq!(tail_size, 8 - 1);
+		let sequence = r.read_u32::<LittleEndian>().unwrap();
+		assert_eq!(sequence, seq);
+		let fragment_id = r.read_u32::<LittleEndian>().unwrap();
+		assert_eq!(fragment_id, frag_id);
+
+		*sent_so_far += data.len();
+	}
+
+	// TODO tests:
+	// 1. ring buffer full (?! should we grow instead?)
+
+	#[test]
+	fn test_basic_packet_formation() {
+		let mut sent_so_far = 0 as usize;
+		let mut packetizer = Sender::new(32);
+
+		let data = &b"keque...."[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0, 0);
+
+		let data = &b"qeqkekek"[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1, 1);
+	}
+
+	#[test]
+	fn test_basic_packet_formation_with_consume() {
+		let mut sent_so_far = 0 as usize;
+		let mut packetizer = Sender::new(16);
+
+		let data = &b"keque...."[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0, 0);
+
+		assert_eq!(packetizer.confirm_read(0).unwrap(), data.len());
+
+		let data = &b"qeqkekek"[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1, 1);
+	}
+
+	#[test]
+	fn test_basic_packet_resend() {
+		let mut sent_so_far = 0 as usize;
+		let mut packetizer = Sender::new(16);
+
+		let data = &b"keque...."[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0, 0);
+
+		packetizer.mark_for_send(0, 1).unwrap();
+		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1, 0);
+
+		assert_eq!(packetizer.confirm_read(0).unwrap(), data.len());
+
+		sent_so_far = data.len();
+		let data = &b"qeqkekek"[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 2, 1);
+	}
+}

@@ -1,7 +1,4 @@
-use {
-	core::num::Wrapping,
-	std::cmp::{Ordering, PartialEq, PartialOrd},
-};
+use core::num::Wrapping;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sequence {
@@ -41,6 +38,7 @@ impl Sequence {
 		}
 	}
 }
+
 // impl PartialEq<u32> for Sequence {
 // 	fn eq(&self, other: &u32) -> bool {
 // 		self.seq.0 == *other
