@@ -2,9 +2,10 @@ use {
 	crate::sequence::Sequence,
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
+	log::{debug, error, info, trace, warn},
 	std::{
 		collections::VecDeque,
-		io::{Cursor, Read, Write},
+		io::{Cursor, Read, Seek, SeekFrom, Write},
 		time::Instant,
 	},
 	thiserror::Error,
@@ -74,6 +75,47 @@ impl<'a> Iterator for ReceivedFragmentIterator<'a> {
 					data_block_index: *data_block_index,
 					sequence,
 				})
+			}
+		}
+	}
+}
+
+#[derive(Eq, PartialEq, Debug, Clone)]
+struct MissingFragment {
+	sequence: u32,
+}
+
+struct MissingFragmentIterator<'a> {
+	fragments: std::iter::Rev<std::collections::vec_deque::Iter<'a, Fragment>>,
+	sequence: u32,
+}
+
+impl<'a> MissingFragmentIterator<'a> {
+	fn new(fragments: &'a Fragments) -> Self {
+		Self {
+			fragments: fragments.fragments.iter().rev(),
+			// FIXME wrapping
+			sequence: fragments.next_expected_sequence - fragments.fragments.len() as u32,
+		}
+	}
+}
+
+impl<'a> Iterator for MissingFragmentIterator<'a> {
+	type Item = MissingFragment;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		loop {
+			match self.fragments.next() {
+				None => return None,
+				Some(Fragment::Received { .. }) => {
+					self.sequence += 1;
+					continue;
+				}
+				Some(Fragment::Unknown { .. }) => {
+					let sequence = self.sequence;
+					self.sequence += 1;
+					return Some(MissingFragment { sequence });
+				}
 			}
 		}
 	}
@@ -178,9 +220,9 @@ impl Fragments {
 		};
 	}
 
-	// fn iter_missing_mut(&mut self) -> FragmentsMissingIteratorMut {
-	// 	unimplemented!()
-	// }
+	fn iter_missing_mut(&mut self) -> MissingFragmentIterator {
+		MissingFragmentIterator::new(self)
+	}
 }
 
 #[cfg(test)]
@@ -284,6 +326,25 @@ mod fragment_tests {
 		assert!(it.next().is_none());
 	}
 
+	#[test]
+	fn basic_insert_missing() {
+		let now = Instant::now();
+		let mut fragments = Fragments::new();
+		fragments.insert(1, 1001, 101, now).unwrap();
+
+		let mut it = fragments.iter_missing_mut();
+		assert_eq!(it.next().unwrap(), MissingFragment { sequence: 0 });
+		assert!(it.next().is_none());
+
+		fragments.insert(5, 1005, 105, now).unwrap();
+		let mut it = fragments.iter_missing_mut();
+		assert_eq!(it.next().unwrap(), MissingFragment { sequence: 0 });
+		assert_eq!(it.next().unwrap(), MissingFragment { sequence: 2 });
+		assert_eq!(it.next().unwrap(), MissingFragment { sequence: 3 });
+		assert_eq!(it.next().unwrap(), MissingFragment { sequence: 4 });
+		assert!(it.next().is_none());
+	}
+
 	// TODO:
 	// 1. 3x fragments insert errors
 	// 2.a insert out of order, confirm zero
@@ -292,45 +353,107 @@ mod fragment_tests {
 	// 4. insert, insert, confirm
 }
 
+#[derive(Debug)]
+struct Blocks {
+	data: Vec<u8>,
+	free: Vec<u32>,
+}
+
+impl Blocks {
+	// FIXME:
+	//  - special type for key instead of just u32
+	//  - include sequence number to ensure that key is not stale
+	fn new(initial_capacity: u32) -> Blocks {
+		Self {
+			data: vec![0u8; initial_capacity as usize * 256],
+			free: (0..initial_capacity).collect(),
+		}
+	}
+
+	fn alloc(&mut self) -> Option<u32> {
+		self.free.pop()
+		// match self.free.pop() {
+		// 	None => return None, // FIXME realloc
+		// 	Some(slot) => return Some(slot),
+		// }
+	}
+
+	fn free(&mut self, slot: u32) {
+		self.free.push(slot);
+	}
+
+	fn get_mut(&mut self, slot: u32) -> Option<&mut [u8]> {
+		// FIXME range, errors
+		let begin = slot as usize * 256;
+		return Some(&mut self.data[begin..begin + 256]);
+	}
+
+	fn get(&mut self, slot: u32) -> Option<&[u8]> {
+		let begin = slot as usize * 256;
+		return Some(&self.data[begin..begin + 256]);
+	}
+}
+
 pub struct Receiver {
-	buffer: CircBuf,
 	packet_seq: Sequence,
 	fragments: Fragments,
+	blocks: Blocks,
 }
 
 impl Receiver {
-	pub fn new(initial_capacity: usize) -> Receiver {
+	pub fn new() -> Receiver {
 		Receiver {
-			buffer: CircBuf::with_capacity(initial_capacity).unwrap(),
 			packet_seq: Sequence::new(),
 			fragments: Fragments::new(),
+			blocks: Blocks::new(16),
 		}
 	}
 
 	pub fn receive_packet(&mut self, data: &[u8]) -> std::io::Result<usize> {
-		if data.len() < 4 {
-			return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, ""));
+		let now = Instant::now(); // TODO receive as argument?
+
+		let mut tail = Cursor::new(&data);
+		loop {
+			let chunk_size = tail.read_u8()? as usize + 1;
+			let left = data.len() - tail.position() as usize;
+			println!("{} {}", chunk_size, left);
+			if left == chunk_size {
+				break;
+			}
+			tail.seek(SeekFrom::Current(chunk_size as i64))?;
 		}
 
-		let now = Instant::now();
+		let mut received = 0 as usize;
+		let mut chunks = Cursor::new(&data);
+		let packet_sequence = tail.read_u32::<LittleEndian>()?;
+		loop {
+			let frag_seq = match tail.read_u32::<LittleEndian>() {
+				Err(..) => break,
+				Ok(value) => value,
+			};
+			let frag_size = chunks.read_u8().unwrap();
 
-		let mut r = Cursor::new(&data);
-		let header = r.read_u32::<LittleEndian>().unwrap();
-		let sequence = header >> 8;
-		let num_fragments = header & 0xff;
-
-		for f in 0..num_fragments {
-			let offset = r.read_u32::<LittleEndian>().unwrap();
-			let size = r.read_u16::<LittleEndian>().unwrap();
-
-			let offset = offset as u64; // FIXME proper mapping
-
-			// FIXME self.fragments.insert(offset, size as usize, now);
-			// 1. read data into buffer
-			// 2. do we need to prepare hint that it became readable
+			let slot = self.blocks.alloc().unwrap(); // FIXME check
+			match self.fragments.insert(frag_seq, slot as u32, frag_size, now) {
+				Ok(()) => {
+					let frag_size = frag_size as usize + 1;
+					let slot = self.blocks.get_mut(slot).unwrap();
+					slot[..frag_size].copy_from_slice(
+						&data[chunks.position() as usize..chunks.position() as usize + frag_size],
+					);
+					received += frag_size;
+				}
+				Err(e) => {
+					error!("{:?}", e);
+					self.blocks.free(slot);
+				}
+			}
+			chunks
+				.seek(SeekFrom::Current(frag_size as i64 + 1))
+				.unwrap();
 		}
 
-		unimplemented!()
+		return Ok(received);
 	}
 
 	pub fn gen_feedback_packet(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -342,5 +465,28 @@ impl Receiver {
 impl Read for Receiver {
 	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
 		unimplemented!()
+	}
+}
+
+#[cfg(test)]
+mod received_tests {
+	use super::*;
+
+	#[test]
+	fn basic_packet_parse() {
+		let mut recv = Receiver::new();
+		let mut buf = [0u8; 32];
+		let mut c = Cursor::new(&mut buf[..]);
+
+		let data = &b"SHLANG"[..];
+		c.write_u8((data.len() - 1) as u8).unwrap();
+		c.write(&data).unwrap();
+
+		c.write_u8(7).unwrap();
+		c.write_u32::<LittleEndian>(0).unwrap();
+		c.write_u32::<LittleEndian>(0).unwrap();
+
+		let pos = c.position() as usize;
+		assert_eq!(recv.receive_packet(&buf[..pos]).unwrap(), data.len());
 	}
 }
