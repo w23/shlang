@@ -14,12 +14,15 @@ use {
 enum FragmentError {
 	#[error("Fragment sequence is too old, expected newer than {oldest_sequence:?}")]
 	TooOld { oldest_sequence: u32 },
+	#[error("Fragment sequence is too new, expected older than {newest_sequence:?}")]
+	TooNew { newest_sequence: u32 },
 	#[error("Fragment already received")]
 	AlreadyReceived,
 	#[error("Fragment already received and has size that differs {known_size:?}")]
 	Inconsistent { known_size: u8 },
 }
 
+#[derive(Debug, Clone)]
 enum Fragment {
 	Unknown {
 		expected_time: Instant,
@@ -32,7 +35,8 @@ enum Fragment {
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 struct ReceivedFragment {
-	size: usize, // real size, not - 1
+	//size: usize, // real size, not - 1
+	size: u8, // size - 1
 	data_block_index: u32,
 	sequence: u32,
 }
@@ -60,13 +64,13 @@ impl<'a> Iterator for ReceivedFragmentIterator<'a> {
 			None => None,
 			Some(Fragment::Unknown { .. }) => None,
 			Some(Fragment::Received {
-				size: size,
-				data_block_index: data_block_index,
+				size,
+				data_block_index,
 			}) => {
 				let sequence = self.sequence;
 				self.sequence += 1;
 				Some(ReceivedFragment {
-					size: *size as usize + 1,
+					size: *size,
 					data_block_index: *data_block_index,
 					sequence,
 				})
@@ -75,6 +79,7 @@ impl<'a> Iterator for ReceivedFragmentIterator<'a> {
 	}
 }
 
+#[derive(Debug)]
 struct Fragments {
 	fragments: VecDeque<Fragment>,
 	next_expected_sequence: u32, // FIXME wrapping
@@ -104,14 +109,7 @@ impl Fragments {
 
 		// FIXME wrapping
 		if seq < self.next_expected_sequence {
-			let index = self.fragments.len() - (self.next_expected_sequence - seq - 1) as usize;
-			println!(
-				"len={} next={} seq={}, index={}",
-				self.fragments.len(),
-				self.next_expected_sequence,
-				seq,
-				index
-			);
+			let index = (self.next_expected_sequence - seq - 1) as usize;
 			return match &mut self.fragments[index] {
 				Fragment::Received {
 					size: known_size, ..
@@ -160,7 +158,24 @@ impl Fragments {
 	}
 
 	fn consume(&mut self, sequence: u32) -> Result<u32, FragmentError> {
-		unimplemented!()
+		// FIXME handle wrapping
+		let to_remain = if sequence >= self.next_expected_sequence {
+			return Err(FragmentError::TooNew {
+				newest_sequence: self.next_expected_sequence - 1,
+			});
+		} else {
+			self.next_expected_sequence - sequence - 1
+		} as usize;
+
+		// TODO check that every fragment was really confirmed?
+
+		if to_remain >= self.fragments.len() {
+			return Ok(0);
+		} else {
+			let deleted = self.fragments.len() - to_remain;
+			self.fragments.truncate(to_remain);
+			return Ok(deleted as u32);
+		};
 	}
 
 	// fn iter_missing_mut(&mut self) -> FragmentsMissingIteratorMut {
@@ -181,7 +196,7 @@ mod fragment_tests {
 		assert_eq!(
 			it.next().unwrap(),
 			ReceivedFragment {
-				size: 256,
+				size: 255,
 				data_block_index: 1337,
 				sequence: 0
 			}
@@ -193,7 +208,7 @@ mod fragment_tests {
 		assert_eq!(
 			it.next().unwrap(),
 			ReceivedFragment {
-				size: 256,
+				size: 255,
 				data_block_index: 1337,
 				sequence: 0
 			}
@@ -201,7 +216,7 @@ mod fragment_tests {
 		assert_eq!(
 			it.next().unwrap(),
 			ReceivedFragment {
-				size: 101,
+				size: 100,
 				data_block_index: 23,
 				sequence: 1
 			}
@@ -222,7 +237,7 @@ mod fragment_tests {
 		assert_eq!(
 			it.next().unwrap(),
 			ReceivedFragment {
-				size: 101,
+				size: 100,
 				data_block_index: 23,
 				sequence: 0
 			}
@@ -230,9 +245,40 @@ mod fragment_tests {
 		assert_eq!(
 			it.next().unwrap(),
 			ReceivedFragment {
-				size: 256,
+				size: 255,
 				data_block_index: 1337,
 				sequence: 1
+			}
+		);
+		assert!(it.next().is_none());
+	}
+
+	#[test]
+	fn basic_insert_confirm() {
+		let now = Instant::now();
+		let mut fragments = Fragments::new();
+		fragments.insert(1, 1001, 101, now).unwrap();
+		fragments.insert(0, 1000, 100, now).unwrap();
+		fragments.insert(3, 1003, 103, now).unwrap();
+		fragments.insert(2, 1002, 102, now).unwrap();
+
+		assert_eq!(fragments.consume(1).unwrap(), 2);
+
+		let mut it = fragments.iter_received();
+		assert_eq!(
+			it.next().unwrap(),
+			ReceivedFragment {
+				size: 102,
+				data_block_index: 1002,
+				sequence: 2
+			}
+		);
+		assert_eq!(
+			it.next().unwrap(),
+			ReceivedFragment {
+				size: 103,
+				data_block_index: 1003,
+				sequence: 3
 			}
 		);
 		assert!(it.next().is_none());
