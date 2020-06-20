@@ -170,7 +170,7 @@ impl Sender {
 			}
 
 			let segment: Segment = it.into();
-			println!("segment {} {}", segment.offset, segment.size);
+			//println!("segment {} {}", segment.offset, segment.size);
 
 			// header
 			left -= 2;
@@ -199,17 +199,13 @@ impl Sender {
 		let buf = wr.get_mut();
 
 		// Re-read packet and remove written segments from list of segments to write
-		println!("{} {}", written, buf.len());
 		let mut rd = Cursor::new(&buf[4..written]);
 		loop {
-			println!("{}", rd.position());
 			let header = match rd.read_u16::<LittleEndian>() {
 				Ok(value) => value,
 				Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
 				_ => panic!("Cannot read header of just written packet"),
 			};
-
-			println!("{:x}", header);
 
 			let size = (header & 2047) as i64;
 			assert!(size > 8);
@@ -225,11 +221,21 @@ impl Sender {
 	}
 
 	pub fn confirm_read(&mut self, offset: u64) -> Result<usize, SenderError> {
-		unimplemented!();
+		if offset < self.buffer_start_offset {
+			return Ok(0);
+		}
 
-		// let advance = self.fragments.confirm(fragment_seq)?;
-		// self.buffer.advance_read(advance);
-		// Ok(advance)
+		let head = self.buffer_start_offset + self.buffer.len() as u64;
+		if offset > head {
+			return Err(SenderError::InvalidOffset { head });
+		}
+
+		let advance = (offset - self.buffer_start_offset) as usize;
+		self.segments.remove(..offset);
+
+		self.buffer.advance_read(advance);
+		self.buffer_start_offset = offset;
+		Ok(advance)
 	}
 
 	pub fn resend(&mut self, offset: u64, size: u16) -> Result<(), SenderError> {
@@ -287,7 +293,7 @@ mod packet_tests {
 	// 2. failures
 
 	#[test]
-	fn test_basic_packet_formation() {
+	fn basic_packet_formation() {
 		let mut sent_so_far = 0 as usize;
 		let mut packetizer = Sender::new(32);
 
@@ -307,7 +313,7 @@ mod packet_tests {
 	}
 
 	#[test]
-	fn test_segmented_packets() {
+	fn segmented_packets() {
 		let mut sent_so_far = 0 as usize;
 		let mut packetizer = Sender::new(64);
 
@@ -318,22 +324,40 @@ mod packet_tests {
 		check_single_fragment_data(&mut packetizer, &data[23..], 2, 23, &mut sent_so_far);
 	}
 
-	// #[test]
-	// fn test_basic_packet_formation_with_consume() {
-	// 	let mut sent_so_far = 0 as usize;
-	// 	let mut packetizer = Sender::new(16);
-	//
-	// 	let data = &b"keque...."[..];
-	// 	write_data(&mut packetizer, &data[..]);
-	// 	check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0, 0);
-	//
-	// 	assert_eq!(packetizer.confirm_read(0).unwrap(), data.len());
-	//
-	// 	let data = &b"qeqkekek"[..];
-	// 	write_data(&mut packetizer, &data[..]);
-	// 	check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1, 1);
-	// }
-	//
+	#[test]
+	fn segmented_consume() {
+		let mut sent_so_far = 0 as usize;
+		let mut packetizer = Sender::new(64);
+
+		let data = &b"IAmALongStringLOOOOOOOOOOOOOOOOOOOOL"[..];
+		write_data(&mut packetizer, &data[..]);
+		assert_eq!(packetizer.confirm_read(17).unwrap(), 17);
+		check_single_fragment_data(&mut packetizer, &data[17..23], 0, 17, &mut sent_so_far);
+		check_single_fragment_data(&mut packetizer, &data[23..], 1, 23, &mut sent_so_far);
+	}
+
+	#[test]
+	fn circbuf_wraparound() {
+		let mut sent_so_far = 0 as usize;
+		let mut packetizer = Sender::new(8);
+
+		let data = &b"0123456"[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(&mut packetizer, &data, 0, 0, &mut sent_so_far);
+
+		assert_eq!(packetizer.confirm_read(5).unwrap(), 5);
+
+		let data = &b"789ab"[..];
+		write_data(&mut packetizer, &data[..]);
+		check_single_fragment_data(
+			&mut packetizer,
+			&data,
+			1,
+			sent_so_far as u64,
+			&mut sent_so_far,
+		);
+	}
+
 	// #[test]
 	// fn test_basic_packet_resend() {
 	// 	let mut sent_so_far = 0 as usize;
