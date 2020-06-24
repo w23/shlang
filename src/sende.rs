@@ -112,6 +112,8 @@ impl From<&GenericRange<u64>> for Segment {
 pub enum SenderError {
 	#[error("Offset too large, must be less than {head:?}")]
 	InvalidOffset { head: u64 },
+	#[error("Requested segment was already confirmed, oldest known is {offset:?}")]
+	RequestedSegmentAlreadyConfirmed { offset: u64 },
 	#[error("Buffer is too small")]
 	BufferTooSmall,
 }
@@ -238,8 +240,25 @@ impl Sender {
 		Ok(advance)
 	}
 
-	pub fn resend(&mut self, offset: u64, size: u16) -> Result<(), SenderError> {
-		unimplemented!();
+	pub fn resend(&mut self, offset: u64, size: u16) -> Result<(u64, u16), SenderError> {
+		let end = offset + size as u64;
+		if end < self.buffer_start_offset {
+			return Err(SenderError::RequestedSegmentAlreadyConfirmed {
+				offset: self.buffer_start_offset,
+			});
+		}
+
+		let head = self.buffer_start_offset + self.buffer.len() as u64;
+		if end > head {
+			return Err(SenderError::InvalidOffset { head });
+		}
+
+		let offset = std::cmp::max(self.buffer_start_offset, offset);
+		assert!(end >= offset);
+
+		self.segments.insert(offset..end);
+
+		Ok((offset, (end - offset) as u16))
 	}
 }
 
@@ -358,23 +377,22 @@ mod packet_tests {
 		);
 	}
 
-	// #[test]
-	// fn test_basic_packet_resend() {
-	// 	let mut sent_so_far = 0 as usize;
-	// 	let mut packetizer = Sender::new(16);
-	//
-	// 	let data = &b"keque...."[..];
-	// 	write_data(&mut packetizer, &data[..]);
-	// 	check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 0, 0);
-	//
-	// 	packetizer.mark_for_send(0, 1).unwrap();
-	// 	check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 1, 0);
-	//
-	// 	assert_eq!(packetizer.confirm_read(0).unwrap(), data.len());
-	//
-	// 	sent_so_far = data.len();
-	// 	let data = &b"qeqkekek"[..];
-	// 	write_data(&mut packetizer, &data[..]);
-	// 	check_single_fragment_data(&mut packetizer, &data, &mut sent_so_far, 2, 1);
-	// }
+	#[test]
+	fn packet_resend() {
+		let mut sent_so_far = 0 as usize;
+		let mut packetizer = Sender::new(64);
+
+		let data = &b"IAmALongStringLOOOOOOOOOOOOOOOOOOOOL"[..];
+		write_data(&mut packetizer, &data[..]);
+
+		check_single_fragment_data(&mut packetizer, &data[0..17], 0, 0, &mut sent_so_far);
+		check_single_fragment_data(&mut packetizer, &data[17..23], 1, 17, &mut sent_so_far);
+		assert_eq!(packetizer.resend(10, 10).unwrap(), (10, 10));
+
+		sent_so_far = 10;
+		check_single_fragment_data(&mut packetizer, &data[10..20], 2, 10, &mut sent_so_far);
+
+		println!("{:?}", packetizer.segments);
+		check_single_fragment_data(&mut packetizer, &data[23..], 3, 23, &mut sent_so_far);
+	}
 }

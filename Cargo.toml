@@ -15,4 +15,7 @@ simple-error = "0.2"
 circbuf = "0.1"
 byteorder = "1"
 thiserror = "1.0"
-ranges = "0.2"
+ranges = "0.3"
+
+[dev-dependencies]
+rand = "0.7"
