@@ -1,3 +1,4 @@
+mod OchenCircusBuf;
 mod receive;
 mod sende;
 mod sequence;
@@ -12,6 +13,7 @@ use {
 		Poll,
 		Token,
 	},
+	receive::Receiver,
 	sende::{ReadPipe, Sender},
 	std::{
 		collections::HashMap,
@@ -147,4 +149,30 @@ fn main() {
 			error!("Runtime error: {}", e);
 		}
 	}
+}
+
+#[cfg(test)]
+mod reassemble {
+	use super::*;
+
+	// #[test]
+	// fn send_receive() {
+	// 	let data: Vec<u8> = (0..1024 * 1024).map(|_| rand::random::<u8>()).collect();
+	//
+	// 	let mut sender = Sender::new(8 * 1024 * 1024);
+	// 	let mut receiver = Receiver::new(1024 * 1024 / 256 + 1);
+	//
+	// 	let mut read_pipe = ReadPipe::new(&data[..]);
+	// 	assert_eq!(sender.write_from(&mut read_pipe).unwrap(), data.len());
+	//
+	// 	loop {
+	// 		let mut buf = [0u8; 1500];
+	// 		let size = sender.generate(&mut buf).unwrap();
+	// 		println!("{}", size);
+	// 		if size == 5 {
+	// 			break;
+	// 		}
+	// 		receiver.receive_packet(&buf[..size]).unwrap();
+	// 	}
+	// }
 }
