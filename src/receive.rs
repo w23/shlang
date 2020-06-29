@@ -3,6 +3,7 @@ use {
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	log::{debug, error, info, trace, warn},
 	std::{
+		cmp::{max, min},
 		collections::VecDeque,
 		io::{Cursor, Error, ErrorKind, Read, Seek, SeekFrom, Write},
 		time::Instant,
@@ -140,6 +141,13 @@ impl MissingSegments {
 
 	fn missing_iter(&mut self) -> MissingSegmentIterator {
 		MissingSegmentIterator::new(&mut self.segments)
+	}
+
+	fn first(&self) -> Option<u64> {
+		match self.segments.first() {
+			Some(segment) => Some(segment.begin),
+			_ => None,
+		}
 	}
 }
 
@@ -335,6 +343,112 @@ impl Receiver {
 		}
 	}
 
+	fn read_chunk_segment(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<usize> {
+		let mut rd = Cursor::new(&chunk);
+		let mut segment_begin = rd.read_u64::<LittleEndian>().unwrap();
+		let mut segment_data = &chunk[8..];
+
+		let mut segment_end = segment_begin + segment_data.len() as u64;
+		if segment_end <= self.buffer_start_offset {
+			// Segment is too old, skip
+			return Ok(0);
+		}
+
+		if segment_begin < self.buffer_start_offset {
+			let shift = (self.buffer_start_offset - segment_begin) as usize;
+			segment_begin = self.buffer_start_offset;
+			segment_data = &segment_data[shift..segment_data.len() - shift];
+		}
+
+		let mut missing_iter = self.missing.missing_iter();
+		'missing: loop {
+			let missing = match missing_iter.next() {
+				Some(item) => item,
+				_ => break 'missing,
+			};
+
+			// missing segment is fully before received segment
+			if missing.end <= segment_begin {
+				continue 'missing;
+			}
+
+			// Missing segment is fully after received segment
+			if missing.begin >= segment_end {
+				// TODO count duplicate received data
+				return Ok(0);
+			}
+
+			// Handle missing & received
+			// Find begin intersection
+			if missing.begin > segment_begin {
+				let shift = (missing.begin - segment_begin) as usize;
+				segment_begin = missing.begin;
+				segment_data = &segment_data[shift..segment_data.len() - shift];
+			};
+
+			let write_end = min(missing.end, segment_end);
+			let to_write_size = (segment_end - write_end) as usize;
+			// Write received to buffer
+			let buf_offset = (segment_begin - self.buffer_start_offset) as usize;
+			let written = self
+				.buffer
+				.write_data_at_read_offset(buf_offset, &segment_data[..to_write_size]);
+
+			if written < to_write_size {
+				panic!("Inconsistent missing vs buffer state. Could write only {} bytes of {} in the middle, offset = {}, global offset = {}", written, to_write_size, buf_offset, self.buffer_start_offset);
+			}
+
+			// Update missing
+			missing_iter.cut_range(segment_begin, write_end, now);
+			//.unwrap();
+
+			// Update segment and early exit if empty
+			let shift = (write_end - segment_begin) as usize;
+			segment_begin = write_end;
+			segment_data = &segment_data[shift..segment_data.len() - shift];
+			if segment_data.len() == 0 {
+				return Ok(0);
+			}
+		}
+
+		// handle head
+		let buffer_head = self.buffer_start_offset + self.buffer.len() as u64;
+		if segment_end > buffer_head {
+			// Write received to buffer
+			let buf_offset = (segment_begin - self.buffer_start_offset) as usize;
+			let written = self
+				.buffer
+				.write_data_at_read_offset(buf_offset, segment_data);
+
+			if written < segment_data.len() {
+				warn!("Write buffer exhausted, could write only {} bytes of {} at offset = {}, global_offset = {}", written, segment_data.len(), buf_offset, self.buffer_start_offset);
+			}
+
+			// If some data was written, then need to check whether we should update missing segments
+			if written > 0 {
+				if segment_begin > buffer_head {
+					println!("add missing {}..{}", buffer_head, segment_begin);
+					self
+						.missing
+						.insert(buffer_head, segment_begin, now)
+						.unwrap();
+				}
+				// else {
+				// 	let shift = (buffer_head - segment_begin) as usize;
+				// 	segment_begin = buffer_head;
+				// 	segment_data = &segment_data[shift..segment_data.len() - shift];
+				// }
+
+				// FIXME why?
+				// if segment_data.len() != 0 {
+				// 	return Ok(0);
+				// }
+			}
+		}
+
+		Ok(0)
+	}
+
 	pub fn receive_packet(&mut self, data: &[u8]) -> std::io::Result<usize> {
 		let now = Instant::now(); // TODO receive as argument?
 
@@ -351,7 +465,7 @@ impl Receiver {
 		let mut rd = Cursor::new(&data);
 		let packet_seq = rd.read_u32::<LittleEndian>()?;
 
-		'chunks: loop {
+		loop {
 			let chunk_head = if let Ok(v) = rd.read_u16::<LittleEndian>() {
 				v
 			} else {
@@ -362,109 +476,24 @@ impl Receiver {
 			let offset = rd.position() as usize;
 			if offset + chunk_size > data.len() {
 				// TODO might have handled some chunks, how to report?
-				return Err(Error::new(ErrorKind::UnexpectedEof, "Chunk ends abruptly"));
+				return Err(Error::new(
+					ErrorKind::UnexpectedEof,
+					format!(
+						"Chunk type {} size {} at offset {} ends abruptly: left {} bytes in packet",
+						chunk_type,
+						chunk_size,
+						offset,
+						data.len() - offset,
+					),
+				));
 			}
 			let chunk_data = &data[offset..offset + chunk_size];
+			rd.seek(SeekFrom::Current(chunk_size as i64)).unwrap();
 
 			match chunk_type {
 				0 => {
 					// Regular data segment chunk
-					let mut segment_begin = rd.read_u64::<LittleEndian>().unwrap();
-					let mut segment_data = &chunk_data[8..chunk_size - 8];
-					rd.seek(SeekFrom::Current(segment_data.len() as i64))
-						.unwrap();
-
-					let mut segment_end = segment_begin + segment_data.len() as u64;
-					if segment_end <= self.buffer_start_offset {
-						// Segment is too old, skip
-						continue;
-					}
-
-					if segment_begin < self.buffer_start_offset {
-						let shift = (self.buffer_start_offset - segment_begin) as usize;
-						segment_begin = self.buffer_start_offset;
-						segment_data = &segment_data[shift..segment_data.len() - shift];
-					}
-
-					let mut missing_iter = self.missing.missing_iter();
-					'missing: loop {
-						let missing = match missing_iter.next() {
-							Some(item) => item,
-							_ => break 'missing,
-						};
-
-						// missing segment is fully before received segment
-						if missing.end <= segment_begin {
-							continue 'missing;
-						}
-
-						// Missing segment is fully after received segment
-						if missing.begin >= segment_end {
-							// TODO count duplicate received data
-							continue 'chunks;
-						}
-
-						// Handle missing & received
-						// Find begin intersection
-						if missing.begin > segment_begin {
-							let shift = (missing.begin - segment_begin) as usize;
-							segment_begin = missing.begin;
-							segment_data = &segment_data[shift..segment_data.len() - shift];
-						};
-
-						let write_end = std::cmp::min(missing.end, segment_end);
-						let to_write_size = (segment_end - write_end) as usize;
-						// Write received to buffer
-						let buf_offset = (segment_begin - self.buffer_start_offset) as usize;
-						let written = self
-							.buffer
-							.write_data_at_read_offset(buf_offset, &segment_data[..to_write_size]);
-
-						if written < to_write_size {
-							panic!(format!("Inconsistent missing vs buffer state. Could write only {} bytes of {} in the middle, offset = {}, global offset = {}", written, to_write_size, buf_offset, self.buffer_start_offset));
-						}
-
-						// Update missing
-						missing_iter.cut_range(segment_begin, write_end, now);
-						//.unwrap();
-
-						// Update segment and early exit if empty
-						let shift = (write_end - segment_begin) as usize;
-						segment_begin = write_end;
-						segment_data = &segment_data[shift..segment_data.len() - shift];
-						if segment_data.len() == 0 {
-							continue 'chunks;
-						}
-					}
-
-					// handle head
-					let buffer_head = self.buffer_start_offset + self.buffer.len() as u64;
-					if segment_end > buffer_head {
-						if segment_begin > buffer_head {
-							self
-								.missing
-								.insert(buffer_head, segment_begin, now)
-								.unwrap();
-						} else {
-							let shift = (buffer_head - segment_begin) as usize;
-							segment_begin = buffer_head;
-							segment_data = &segment_data[shift..segment_data.len() - shift];
-						}
-
-						if segment_data.len() == 0 {
-							continue 'chunks;
-						}
-
-						// Write received to buffer
-						let buf_offset = (segment_begin - self.buffer_start_offset) as usize;
-						let written = self
-							.buffer
-							.write_data_at_read_offset(buf_offset, segment_data);
-
-						if written < segment_data.len() {
-							warn!("Write buffer exhausted, could write only {} bytes of {} at offset = {}, global_offset = {}", written, segment_data.len(), buf_offset, self.buffer_start_offset);
-						}
-					}
+					self.read_chunk_segment(chunk_data, now)?;
 				}
 				_ => {
 					// TODO might have handled some chunks, how to report?
@@ -487,12 +516,35 @@ impl Receiver {
 
 impl Read for Receiver {
 	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		unimplemented!();
+		let size = match self.missing.first() {
+			Some(offset) => (offset - self.buffer_start_offset) as usize,
+			None => self.buffer.len(),
+		};
+
+		let buf_len = buf.len();
+		let dest = &mut buf[..min(buf_len, size)];
+		let mut written = 0;
+
+		let [buf1, buf2] = self.buffer.get_data();
+
+		let copy_size = min(dest.len(), buf1.len());
+		dest[..copy_size].clone_from_slice(&buf1[..copy_size]);
+		written += copy_size;
+
+		let dest = &mut dest[copy_size..];
+		if dest.len() > 0 {
+			let copy_size = min(dest.len(), buf2.len());
+			dest[..copy_size].clone_from_slice(&buf2[..copy_size]);
+			written += copy_size;
+		}
+		self.buffer.consume(written);
+		self.buffer_start_offset += written as u64;
+		Ok(written)
 	}
 }
 
 #[cfg(test)]
-mod received_tests {
+mod receiver_tests {
 	use super::*;
 
 	// #[test]

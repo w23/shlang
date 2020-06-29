@@ -155,24 +155,33 @@ fn main() {
 mod reassemble {
 	use super::*;
 
-	// #[test]
-	// fn send_receive() {
-	// 	let data: Vec<u8> = (0..1024 * 1024).map(|_| rand::random::<u8>()).collect();
-	//
-	// 	let mut sender = Sender::new(8 * 1024 * 1024);
-	// 	let mut receiver = Receiver::new(1024 * 1024 / 256 + 1);
-	//
-	// 	let mut read_pipe = ReadPipe::new(&data[..]);
-	// 	assert_eq!(sender.write_from(&mut read_pipe).unwrap(), data.len());
-	//
-	// 	loop {
-	// 		let mut buf = [0u8; 1500];
-	// 		let size = sender.generate(&mut buf).unwrap();
-	// 		println!("{}", size);
-	// 		if size == 5 {
-	// 			break;
-	// 		}
-	// 		receiver.receive_packet(&buf[..size]).unwrap();
-	// 	}
-	// }
+	#[test]
+	fn send_receive_ideal_ordered() {
+		let data: Vec<u8> = (0..1024 * 1024 * 2).map(|_| rand::random::<u8>()).collect();
+
+		let mut sender = Sender::new(8 * 1024 * 1024);
+		let mut receiver = Receiver::new(); //1024 * 1024 / 256 + 1);
+
+		let mut read_pipe = ReadPipe::new(&data[..]);
+		assert_eq!(sender.write_from(&mut read_pipe).unwrap(), data.len());
+
+		let mut offset = 0;
+		loop {
+			let mut buf = [0u8; 1500];
+			let size = sender.generate(&mut buf).unwrap();
+
+			println!("{}", size);
+			if size == 4 {
+				// Means no chunks
+				break;
+			}
+			receiver.receive_packet(&buf[..size]).unwrap();
+
+			let read = receiver.read(&mut buf).unwrap();
+			println!("read {}", read);
+			assert_eq!(&data[offset..offset + read], &buf[..read]);
+			offset += read;
+		}
+		assert_eq!(offset, data.len());
+	}
 }

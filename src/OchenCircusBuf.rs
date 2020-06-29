@@ -24,6 +24,10 @@ impl OchenCircusBuf {
 	}
 
 	pub fn write_data_at_read_offset(&mut self, offset: usize, data: &[u8]) -> usize {
+		if offset >= self.buf.len() {
+			return 0;
+		}
+
 		let write_size = min(self.buf.len() - offset - 1, data.len());
 		let write_pos = (self.read + offset) % self.buf.len();
 
