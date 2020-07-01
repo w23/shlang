@@ -157,11 +157,14 @@ mod reassemble {
 
 	use rand::rngs::SmallRng;
 	use rand::seq::SliceRandom;
-	use rand::{Rng, SeedableRng};
+	use rand::{Rng, RngCore, SeedableRng};
 
 	#[test]
 	fn send_receive_ideal_ordered() {
-		let data: Vec<u8> = (0..1024 * 1024 * 2).map(|_| rand::random::<u8>()).collect();
+		let mut rng = SmallRng::from_seed([0u8; 16]);
+		let mut data = vec![0u8; 1 * 1024 * 1024];
+		rng.fill_bytes(&mut data);
+		let data = &data;
 
 		let mut sender = Sender::new(8 * 1024 * 1024);
 		let mut receiver = Receiver::new(); //1024 * 1024 / 256 + 1);
@@ -192,7 +195,9 @@ mod reassemble {
 	#[test]
 	fn send_receive_random_order() {
 		let mut rng = SmallRng::from_seed([0u8; 16]);
-		let data: Vec<u8> = (0..1024 * 1024 * 2).map(|_| rand::random::<u8>()).collect();
+		let mut data = vec![0u8; 1 * 1024 * 1024];
+		rng.fill_bytes(&mut data);
+		let data = &data;
 
 		let mut sender = Sender::new(8 * 1024 * 1024);
 		let mut receiver = Receiver::new(); //1024 * 1024 / 256 + 1);
