@@ -155,6 +155,10 @@ fn main() {
 mod reassemble {
 	use super::*;
 
+	use rand::rngs::SmallRng;
+	use rand::seq::SliceRandom;
+	use rand::{Rng, SeedableRng};
+
 	#[test]
 	fn send_receive_ideal_ordered() {
 		let data: Vec<u8> = (0..1024 * 1024 * 2).map(|_| rand::random::<u8>()).collect();
@@ -184,4 +188,56 @@ mod reassemble {
 		}
 		assert_eq!(offset, data.len());
 	}
+
+	#[test]
+	fn send_receive_random_order() {
+		let mut rng = SmallRng::from_seed([0u8; 16]);
+		let data: Vec<u8> = (0..1024 * 1024 * 2).map(|_| rand::random::<u8>()).collect();
+
+		let mut sender = Sender::new(8 * 1024 * 1024);
+		let mut receiver = Receiver::new(); //1024 * 1024 / 256 + 1);
+
+		let mut read_pipe = ReadPipe::new(&data[..]);
+		assert_eq!(sender.write_from(&mut read_pipe).unwrap(), data.len());
+
+		let mut sent = false;
+		let mut packets = Vec::<([u8; 1500], usize)>::new();
+		let mut offset = 0;
+		loop {
+			let mut buf = [0u8; 1500];
+			if !sent {
+				let size = sender.generate(&mut buf).unwrap();
+
+				println!("{}", size);
+				if size == 4 {
+					// Means no chunks
+					sent = true;
+				} else {
+					packets.push((buf, size));
+				}
+			}
+
+			if sent || packets.len() > 7 {
+				packets.shuffle(&mut rng);
+				let (packet, size) = match packets.pop() {
+					Some(packet) => packet,
+					None => break,
+				};
+				receiver.receive_packet(&packet[..size]).unwrap();
+				loop {
+					let read = receiver.read(&mut buf).unwrap();
+					println!("read {}", read);
+					if read == 0 {
+						break;
+					}
+					assert_eq!(&data[offset..offset + read], &buf[..read]);
+					offset += read;
+				}
+			}
+		}
+		assert_eq!(offset, data.len());
+	}
+	// TODO:
+	// 1. random order
+	// 2. packet loss
 }

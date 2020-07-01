@@ -156,6 +156,38 @@ mod segment_tests {
 	use super::*;
 
 	#[test]
+	fn shlangobidon() {
+		let now = Instant::now();
+		let mut segs = MissingSegments::new();
+		segs.insert(0, 7, now).unwrap();
+		let mut iter = segs.missing_iter();
+		assert_eq!(
+			iter.next().unwrap(),
+			&MissingSegment {
+				begin: 0,
+				end: 7,
+				timestamp: now
+			}
+		);
+		assert!(iter.next().is_none());
+
+		let mut iter = segs.missing_iter();
+		assert_eq!(
+			iter.next().unwrap(),
+			&MissingSegment {
+				begin: 0,
+				end: 7,
+				timestamp: now
+			}
+		);
+		iter.cut_range(0, 7, now);
+		assert!(iter.next().is_none());
+
+		let mut iter = segs.missing_iter();
+		assert!(iter.next().is_none());
+	}
+
+	#[test]
 	fn insert_iter() {
 		let now = Instant::now();
 		let mut segs = MissingSegments::new();
@@ -360,12 +392,22 @@ impl Receiver {
 			segment_data = &segment_data[shift..segment_data.len() - shift];
 		}
 
+		println!("buffer_start_offset={}", self.buffer_start_offset);
+		println!(
+			"Receive segment @{}..{} ({})",
+			segment_begin,
+			segment_end,
+			segment_data.len()
+		);
+
 		let mut missing_iter = self.missing.missing_iter();
 		'missing: loop {
 			let missing = match missing_iter.next() {
 				Some(item) => item,
 				_ => break 'missing,
 			};
+
+			println!("  Missing {:?}", missing);
 
 			// missing segment is fully before received segment
 			if missing.end <= segment_begin {
@@ -386,10 +428,22 @@ impl Receiver {
 				segment_data = &segment_data[shift..segment_data.len() - shift];
 			};
 
+			println!(
+				"    segment_begin={} len={}",
+				segment_begin,
+				segment_data.len()
+			);
+
 			let write_end = min(missing.end, segment_end);
-			let to_write_size = (segment_end - write_end) as usize;
+			let to_write_size = (write_end - segment_begin) as usize;
 			// Write received to buffer
 			let buf_offset = (segment_begin - self.buffer_start_offset) as usize;
+
+			println!(
+				"    segment_begin={} write_end={} to_write_size={} buf_offset={}",
+				segment_begin, write_end, to_write_size, buf_offset
+			);
+
 			let written = self
 				.buffer
 				.write_data_at_read_offset(buf_offset, &segment_data[..to_write_size]);
@@ -405,7 +459,7 @@ impl Receiver {
 			// Update segment and early exit if empty
 			let shift = (write_end - segment_begin) as usize;
 			segment_begin = write_end;
-			segment_data = &segment_data[shift..segment_data.len() - shift];
+			segment_data = &segment_data[shift..segment_data.len()];
 			if segment_data.len() == 0 {
 				return Ok(0);
 			}
@@ -517,8 +571,14 @@ impl Receiver {
 impl Read for Receiver {
 	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
 		let size = match self.missing.first() {
-			Some(offset) => (offset - self.buffer_start_offset) as usize,
-			None => self.buffer.len(),
+			Some(offset) => {
+				println!("missing first={}", offset);
+				(offset - self.buffer_start_offset) as usize
+			}
+			None => {
+				println!("buffer len={}", self.buffer.len());
+				self.buffer.len()
+			}
 		};
 
 		let buf_len = buf.len();
@@ -547,86 +607,109 @@ impl Read for Receiver {
 mod receiver_tests {
 	use super::*;
 
-	// #[test]
-	// fn basic_packet_parse() {
-	// 	let mut recv = Receiver::new(4);
-	// 	let mut buf = [0u8; 32];
-	// 	let mut c = Cursor::new(&mut buf[..]);
-	//
-	// 	let data = &b"SHLANG"[..];
-	// 	c.write_u8((data.len() - 1) as u8).unwrap();
-	// 	c.write(&data).unwrap();
-	//
-	// 	c.write_u8(7).unwrap();
-	// 	c.write_u32::<LittleEndian>(0).unwrap();
-	// 	c.write_u32::<LittleEndian>(0).unwrap();
-	//
-	// 	let pos = c.position() as usize;
-	// 	assert_eq!(recv.receive_packet(&buf[..pos]).unwrap(), data.len());
-	//
-	// 	let mut buf = [0u8; 32];
-	// 	assert_eq!(recv.read(&mut buf).unwrap(), data.len());
-	// 	assert_eq!(&buf[..data.len()], data);
-	// }
-	//
-	// #[test]
-	// fn basic_packet_2fragments_parse() {
-	// 	let mut recv = Receiver::new(4);
-	// 	let mut buf = [0u8; 32];
-	// 	let mut c = Cursor::new(&mut buf[..]);
-	//
-	// 	let data1 = &b"SHLANG"[..];
-	// 	c.write_u8((data1.len() - 1) as u8).unwrap();
-	// 	c.write(&data1).unwrap();
-	//
-	// 	let data2 = &b"TPOC"[..];
-	// 	c.write_u8((data2.len() - 1) as u8).unwrap();
-	// 	c.write(&data2).unwrap();
-	//
-	// 	c.write_u8(3 * 4 - 1).unwrap();
-	// 	c.write_u32::<LittleEndian>(0).unwrap();
-	// 	c.write_u32::<LittleEndian>(0).unwrap();
-	// 	c.write_u32::<LittleEndian>(1).unwrap();
-	//
-	// 	let pos = c.position() as usize;
-	// 	assert_eq!(
-	// 		recv.receive_packet(&buf[..pos]).unwrap(),
-	// 		data1.len() + data2.len()
-	// 	);
-	//
-	// 	let mut buf = [0u8; 32];
-	// 	assert_eq!(recv.read(&mut buf).unwrap(), data1.len() + data2.len());
-	// 	assert_eq!(&buf[..data1.len()], data1);
-	// 	assert_eq!(&buf[data1.len()..data1.len() + data2.len()], data2);
-	// }
-	//
-	// #[test]
-	// fn basic_packet_read_split() {
-	// 	let mut recv = Receiver::new(4);
-	// 	let mut buf = [0u8; 32];
-	// 	let mut c = Cursor::new(&mut buf[..]);
-	//
-	// 	let data = &b"SHLANG"[..];
-	// 	c.write_u8((data.len() - 1) as u8).unwrap();
-	// 	c.write(&data).unwrap();
-	//
-	// 	c.write_u8(7).unwrap();
-	// 	c.write_u32::<LittleEndian>(0).unwrap();
-	// 	c.write_u32::<LittleEndian>(0).unwrap();
-	//
-	// 	let pos = c.position() as usize;
-	// 	assert_eq!(recv.receive_packet(&buf[..pos]).unwrap(), data.len());
-	//
-	// 	let mut buf = [0u8; 3];
-	// 	assert_eq!(recv.read(&mut buf).unwrap(), 3);
-	// 	assert_eq!(buf, data[..3]);
-	//
-	// 	let mut buf = [0u8; 2];
-	// 	assert_eq!(recv.read(&mut buf).unwrap(), 2);
-	// 	assert_eq!(buf, data[3..5]);
-	//
-	// 	let mut buf = [0u8; 32];
-	// 	assert_eq!(recv.read(&mut buf).unwrap(), 1);
-	// 	assert_eq!(buf[..1], data[5..]);
-	// }
+	struct Segment<'a> {
+		offset: u64,
+		data: &'a [u8],
+	}
+
+	struct Packet<'a> {
+		seq: u32,
+		segments: &'a [Segment<'a>],
+	}
+
+	fn push_packet(recv: &mut Receiver, pkt: &Packet) {
+		let mut buf = [0u8; 1500];
+		let mut c = Cursor::new(&mut buf[..]);
+
+		c.write_u32::<LittleEndian>(pkt.seq).unwrap();
+		for seg in pkt.segments {
+			let header: u16 = (0u16 << 11) | (seg.data.len() + 8) as u16;
+			c.write_u16::<LittleEndian>(header).unwrap();
+			c.write_u64::<LittleEndian>(seg.offset).unwrap();
+			assert_eq!(c.write(seg.data).unwrap(), seg.data.len());
+		}
+
+		let size = c.position() as usize;
+		recv.receive_packet(&buf[..size]).unwrap();
+	}
+
+	#[test]
+	fn basic_packet_parse() {
+		let mut recv = Receiver::new();
+
+		let data = &b"SHLANG"[..];
+		push_packet(
+			&mut recv,
+			&Packet {
+				seq: 0,
+				segments: &[Segment {
+					offset: 0,
+					data: &data,
+				}],
+			},
+		);
+
+		let mut buf = [0u8; 32];
+		assert_eq!(recv.read(&mut buf).unwrap(), data.len());
+		assert_eq!(&buf[..data.len()], data);
+	}
+
+	#[test]
+	fn basic_packet_parse_2seg() {
+		let mut recv = Receiver::new();
+
+		let data = &b"SHLANGOKEFIR"[..];
+		push_packet(
+			&mut recv,
+			&Packet {
+				seq: 0,
+				segments: &[
+					Segment {
+						offset: 0,
+						data: &data[..5],
+					},
+					Segment {
+						offset: 5,
+						data: &data[5..],
+					},
+				],
+			},
+		);
+
+		let mut buf = [0u8; 32];
+		assert_eq!(recv.read(&mut buf).unwrap(), data.len());
+		assert_eq!(&buf[..data.len()], data);
+	}
+
+	#[test]
+	fn packet_out_of_order() {
+		let mut recv = Receiver::new();
+
+		let data = &b"SHLANGOBIDON"[..];
+		push_packet(
+			&mut recv,
+			&Packet {
+				seq: 1,
+				segments: &[Segment {
+					offset: 7,
+					data: &data[7..],
+				}],
+			},
+		);
+
+		push_packet(
+			&mut recv,
+			&Packet {
+				seq: 0,
+				segments: &[Segment {
+					offset: 0,
+					data: &data[..7],
+				}],
+			},
+		);
+
+		let mut buf = [0u8; 32];
+		assert_eq!(recv.read(&mut buf).unwrap(), data.len());
+		assert_eq!(&buf[..data.len()], data);
+	}
 }

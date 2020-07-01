@@ -18,4 +18,4 @@ thiserror = "1.0"
 ranges = "0.3"
 
 [dev-dependencies]
-rand = "0.7"
+rand = {version = "0.7", features = ["small_rng"]}
