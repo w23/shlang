@@ -122,6 +122,7 @@ impl MissingSegments {
 	// Insert new known missing segment
 	// Only supports adding at the head
 	fn insert(&mut self, begin: u64, end: u64, timestamp: Instant) -> Result<(), SegmentationFault> {
+		assert!(begin <= end);
 		match self.segments.last() {
 			Some(segment) if segment.end > begin => {
 				return Err(SegmentationFault::TooOld {
@@ -363,6 +364,7 @@ pub struct Receiver {
 	missing: MissingSegments,
 	buffer: OchenCircusBuf,
 	buffer_start_offset: u64,
+	stream_front: u64,
 }
 
 impl Receiver {
@@ -372,6 +374,7 @@ impl Receiver {
 			missing: MissingSegments::new(),
 			buffer: OchenCircusBuf::with_capacity(1024 * 1024),
 			buffer_start_offset: 0,
+			stream_front: 0,
 		}
 	}
 
@@ -477,27 +480,6 @@ impl Receiver {
 			if written < segment_data.len() {
 				warn!("Write buffer exhausted, could write only {} bytes of {} at offset = {}, global_offset = {}", written, segment_data.len(), buf_offset, self.buffer_start_offset);
 			}
-
-			// If some data was written, then need to check whether we should update missing segments
-			if written > 0 {
-				if segment_begin > buffer_head {
-					println!("add missing {}..{}", buffer_head, segment_begin);
-					self
-						.missing
-						.insert(buffer_head, segment_begin, now)
-						.unwrap();
-				}
-				// else {
-				// 	let shift = (buffer_head - segment_begin) as usize;
-				// 	segment_begin = buffer_head;
-				// 	segment_data = &segment_data[shift..segment_data.len() - shift];
-				// }
-
-				// FIXME why?
-				// if segment_data.len() != 0 {
-				// 	return Ok(0);
-				// }
-			}
 		}
 
 		Ok(0)
@@ -518,6 +500,14 @@ impl Receiver {
 
 		let mut rd = Cursor::new(&data);
 		let packet_seq = rd.read_u32::<LittleEndian>()?;
+		let stream_front = rd.read_u64::<LittleEndian>()?;
+		if stream_front > self.stream_front {
+			self
+				.missing
+				.insert(self.stream_front, stream_front, now)
+				.unwrap();
+			self.stream_front = stream_front;
+		}
 
 		loop {
 			let chunk_head = if let Ok(v) = rd.read_u16::<LittleEndian>() {
@@ -562,9 +552,65 @@ impl Receiver {
 		Ok(rd.position() as usize)
 	}
 
-	pub fn gen_feedback_packet(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		//for missing in self.fragments.missing() {}
-		unimplemented!()
+	pub fn gen_feedback_packet(
+		&mut self,
+		buf: &mut [u8], /* TODO filter by Instant */
+	) -> std::io::Result<usize> {
+		// check that there's enough space to write at least one header
+		if buf.len() < 14 {
+			return Ok(0); // TODO or error?
+		}
+
+		let mut left = buf.len() - 4;
+		let mut wr = Cursor::new(buf);
+		wr.write_u32::<LittleEndian>(self.packet_seq.next())
+			.unwrap();
+
+		// Put chunk header placeholder
+		let chunk_header_offset = wr.position();
+		let header: u16 = (1u16 << 11) | 0 as u16;
+		left -= 2;
+		wr.write_u16::<LittleEndian>(header).unwrap();
+
+		// write consumed offset placeholder
+		left -= 14;
+		wr.write_u64::<LittleEndian>(self.buffer_start_offset)
+			.unwrap();
+
+		let mut consumed_offset = None;
+		let mut iter = self.missing.missing_iter();
+		loop {
+			if left < 12 {
+				break;
+			}
+
+			let segment = match iter.next() {
+				Some(segment) => segment,
+				None => break,
+			};
+
+			if consumed_offset.is_none() {
+				consumed_offset = Some(segment.begin);
+			}
+
+			wr.write_u64::<LittleEndian>(segment.begin).unwrap();
+			let size = segment.end - segment.begin;
+			wr.write_u32::<LittleEndian>(size as u32).unwrap();
+			left -= 12;
+		}
+
+		let wr_end = wr.position();
+		let chunk_size = wr_end - chunk_header_offset - 2;
+
+		wr.seek(SeekFrom::Start(chunk_header_offset)).unwrap();
+		let header: u16 = (1u16 << 11) | chunk_size as u16;
+		wr.write_u16::<LittleEndian>(header).unwrap();
+		if let Some(offset) = consumed_offset {
+			assert!(offset >= self.buffer_start_offset);
+			wr.write_u64::<LittleEndian>(offset).unwrap();
+		}
+
+		Ok(wr_end as usize)
 	}
 }
 
@@ -614,6 +660,7 @@ mod receiver_tests {
 
 	struct Packet<'a> {
 		seq: u32,
+		front: usize,
 		segments: &'a [Segment<'a>],
 	}
 
@@ -622,6 +669,8 @@ mod receiver_tests {
 		let mut c = Cursor::new(&mut buf[..]);
 
 		c.write_u32::<LittleEndian>(pkt.seq).unwrap();
+		c.write_u64::<LittleEndian>(pkt.front as u64).unwrap();
+
 		for seg in pkt.segments {
 			let header: u16 = (0u16 << 11) | (seg.data.len() + 8) as u16;
 			c.write_u16::<LittleEndian>(header).unwrap();
@@ -642,6 +691,7 @@ mod receiver_tests {
 			&mut recv,
 			&Packet {
 				seq: 0,
+				front: data.len(),
 				segments: &[Segment {
 					offset: 0,
 					data: &data,
@@ -663,6 +713,7 @@ mod receiver_tests {
 			&mut recv,
 			&Packet {
 				seq: 0,
+				front: data.len(),
 				segments: &[
 					Segment {
 						offset: 0,
@@ -690,6 +741,7 @@ mod receiver_tests {
 			&mut recv,
 			&Packet {
 				seq: 1,
+				front: data.len(),
 				segments: &[Segment {
 					offset: 7,
 					data: &data[7..],
@@ -701,6 +753,7 @@ mod receiver_tests {
 			&mut recv,
 			&Packet {
 				seq: 0,
+				front: data.len(),
 				segments: &[Segment {
 					offset: 0,
 					data: &data[..7],

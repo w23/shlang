@@ -2,13 +2,14 @@ use {
 	crate::sequence::Sequence,
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
+	log::{debug, error, info, trace, warn},
 	ranges::{GenericRange, Ranges},
 	//core::num::Wrapping,
 	std::{
 		collections::VecDeque,
 		//error::Error,
 		//fmt,
-		io::{Cursor, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
+		io::{Cursor, Error, ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
 		ops::{Bound, RangeBounds},
 		//vec::Vec,
 	},
@@ -111,11 +112,19 @@ impl From<&GenericRange<u64>> for Segment {
 #[derive(Error, Debug, Clone)]
 pub enum SenderError {
 	#[error("Offset too large, must be less than {head:?}")]
-	InvalidOffset { head: u64 },
+	InvalidOffset { offset: u64, head: u64 },
 	#[error("Requested segment was already confirmed, oldest known is {offset:?}")]
 	RequestedSegmentAlreadyConfirmed { offset: u64 },
 	#[error("Buffer is too small")]
 	BufferTooSmall,
+	#[error("Io error")]
+	IoError { kind: ErrorKind },
+}
+
+impl From<std::io::Error> for SenderError {
+	fn from(err: std::io::Error) -> Self {
+		Self::IoError { kind: err.kind() }
+	}
 }
 
 pub struct Sender {
@@ -156,13 +165,17 @@ impl Sender {
 		//      - u8 payload[chunk size - 8]
 
 		// check that there's enough space to write at least one header
-		if buf.len() < 6 {
+		if buf.len() < 14 {
 			return Err(SenderError::BufferTooSmall);
 		}
 
 		let mut left = buf.len() - 4;
 		let mut wr = Cursor::new(buf);
 		wr.write_u32::<LittleEndian>(self.packet_seq.next())
+			.unwrap();
+
+		left -= 8;
+		wr.write_u64::<LittleEndian>(self.buffer_start_offset + self.buffer.len() as u64)
 			.unwrap();
 
 		// Iterate through segments to write and build payload
@@ -201,7 +214,7 @@ impl Sender {
 		let buf = wr.get_mut();
 
 		// Re-read packet and remove written segments from list of segments to write
-		let mut rd = Cursor::new(&buf[4..written]);
+		let mut rd = Cursor::new(&buf[12..written]);
 		loop {
 			let header = match rd.read_u16::<LittleEndian>() {
 				Ok(value) => value,
@@ -229,7 +242,7 @@ impl Sender {
 
 		let head = self.buffer_start_offset + self.buffer.len() as u64;
 		if offset > head {
-			return Err(SenderError::InvalidOffset { head });
+			return Err(SenderError::InvalidOffset { offset, head });
 		}
 
 		let advance = (offset - self.buffer_start_offset) as usize;
@@ -240,7 +253,7 @@ impl Sender {
 		Ok(advance)
 	}
 
-	pub fn resend(&mut self, offset: u64, size: u16) -> Result<(u64, u16), SenderError> {
+	pub fn resend(&mut self, offset: u64, size: u32) -> Result<(u64, u32), SenderError> {
 		let end = offset + size as u64;
 		if end < self.buffer_start_offset {
 			return Err(SenderError::RequestedSegmentAlreadyConfirmed {
@@ -250,7 +263,7 @@ impl Sender {
 
 		let head = self.buffer_start_offset + self.buffer.len() as u64;
 		if end > head {
-			return Err(SenderError::InvalidOffset { head });
+			return Err(SenderError::InvalidOffset { offset: end, head });
 		}
 
 		let offset = std::cmp::max(self.buffer_start_offset, offset);
@@ -258,7 +271,98 @@ impl Sender {
 
 		self.segments.insert(offset..end);
 
-		Ok((offset, (end - offset) as u16))
+		Ok((offset, (end - offset) as u32))
+	}
+
+	fn read_chunk_feedback(&mut self, chunk: &[u8]) -> Result<(), SenderError> {
+		let mut rd = Cursor::new(&chunk);
+		let consumed_offset = rd.read_u64::<LittleEndian>()?;
+		self.confirm_read(dbg!(consumed_offset))?;
+
+		loop {
+			// TODO better packing
+			let offset = match rd.read_u64::<LittleEndian>() {
+				Ok(offset) => offset,
+				Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+				Err(e) => return Err(SenderError::IoError { kind: e.kind() }),
+			};
+
+			let size = rd.read_u32::<LittleEndian>()?;
+
+			println!("read resend: {} {}", offset, size);
+
+			self.resend(offset, size)?;
+		}
+
+		Ok(())
+	}
+
+	pub fn receive_feedback(&mut self, data: &[u8]) -> Result<(), SenderError> {
+		// u32 packet sequence number
+		// chunks[]:
+		//  - u16 head:
+		//   	- high 4 bits: type/flags
+		//   	- low 11 bits: chunk size
+		//  - u8 data[chunk size]
+		//   	- type == 0
+		//      - u64 offset
+		//      - u8 payload[chunk size - 8]
+		//   	- type == 1
+		//      - u64 confirm_offset
+		//      - [] chunks to resend
+		//      	- u64 offset
+		//      	- u16 size
+
+		let mut rd = Cursor::new(&data);
+		let packet_seq = rd.read_u32::<LittleEndian>()?;
+
+		loop {
+			let chunk_head = if let Ok(v) = rd.read_u16::<LittleEndian>() {
+				v
+			} else {
+				break;
+			};
+			let chunk_type = (chunk_head >> 11) as usize;
+			let chunk_size = (chunk_head & 2047) as usize;
+			let offset = rd.position() as usize;
+			if offset + chunk_size > data.len() {
+				// TODO might have handled some chunks, how to report?
+				// TODO better error reporting vs logging
+				println!(
+					"Chunk type {} size {} at offset {} ends abruptly: left {} bytes in packet",
+					chunk_type,
+					chunk_size,
+					offset,
+					data.len() - offset,
+				);
+				return Err(SenderError::IoError {
+					kind: ErrorKind::UnexpectedEof,
+				});
+			}
+			let chunk_data = &data[offset..offset + chunk_size];
+			rd.seek(SeekFrom::Current(chunk_size as i64)).unwrap();
+
+			println!(
+				"chunk @{} sz={} contents:{:?}",
+				offset, chunk_size, chunk_data
+			);
+
+			match chunk_type {
+				1 => {
+					// Regular data segment chunk
+					self.read_chunk_feedback(chunk_data)?;
+				}
+				_ => {
+					// TODO might have handled some chunks, how to report?
+					error!("Unknown chunk type {} with size {}", chunk_type, chunk_size);
+					return Err(SenderError::IoError {
+						kind: ErrorKind::InvalidData,
+					});
+				}
+			}
+		}
+
+		Ok(())
 	}
 }
 
@@ -278,7 +382,7 @@ mod packet_tests {
 		expect_offset: u64,
 		sent_so_far: &mut usize,
 	) {
-		let header_size = 4 + 2 + 8;
+		let header_size = 4 + 2 + 8 + 8;
 		let mut buffer = vec![0u8; expect_data.len() + header_size];
 		let packet_size = packetizer.generate(&mut buffer).unwrap();
 		assert_eq!(packet_size, header_size + expect_data.len());
@@ -288,6 +392,8 @@ mod packet_tests {
 		let mut r = Cursor::new(&buffer);
 		let packet_seq = r.read_u32::<LittleEndian>().unwrap();
 		assert_eq!(expect_packet_seq, packet_seq);
+
+		let _front = r.read_u64::<LittleEndian>().unwrap();
 
 		let chunk_header = r.read_u16::<LittleEndian>().unwrap();
 		let chunk_type = chunk_header >> 11;

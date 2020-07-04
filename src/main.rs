@@ -178,7 +178,7 @@ mod reassemble {
 			let size = sender.generate(&mut buf).unwrap();
 
 			println!("{}", size);
-			if size == 4 {
+			if size == 12 {
 				// Means no chunks
 				break;
 			}
@@ -214,7 +214,7 @@ mod reassemble {
 				let size = sender.generate(&mut buf).unwrap();
 
 				println!("{}", size);
-				if size == 4 {
+				if size == 12 {
 					// Means no chunks
 					sent = true;
 				} else {
@@ -242,7 +242,56 @@ mod reassemble {
 		}
 		assert_eq!(offset, data.len());
 	}
+
+	#[test]
+	fn send_receive_lost_10pct() {
+		let mut rng = SmallRng::from_seed([0u8; 16]);
+		let mut data = vec![0u8; 1 * 1024 * 1024];
+		rng.fill_bytes(&mut data);
+		let data = &data;
+
+		let mut sender = Sender::new(8 * 1024 * 1024);
+		let mut receiver = Receiver::new(); //1024 * 1024 / 256 + 1);
+
+		let mut read_pipe = ReadPipe::new(&data[..]);
+		assert_eq!(sender.write_from(&mut read_pipe).unwrap(), data.len());
+
+		let mut counter = 0;
+		let mut offset = 0;
+		loop {
+			let mut buf = [0u8; 1500];
+			let size = sender.generate(&mut buf).unwrap();
+			if size > 12 {
+				println!("{}", size);
+				if rng.gen_range(0, 100) > 9 {
+					receiver.receive_packet(&buf[..size]).unwrap();
+				}
+			}
+
+			counter += 1;
+			if counter % 10 == 9 {
+				let size = receiver.gen_feedback_packet(&mut buf).unwrap();
+				println!("feedback: {:?}", &buf[..size]);
+				sender.receive_feedback(&buf[..size]).unwrap();
+			}
+
+			loop {
+				let read = receiver.read(&mut buf).unwrap();
+				println!("read {}", read);
+				if read == 0 {
+					break;
+				}
+				assert_eq!(&data[offset..offset + read], &buf[..read]);
+				offset += read;
+			}
+
+			if dbg!(offset) == dbg!(data.len()) {
+				break;
+			}
+		}
+		assert_eq!(offset, data.len());
+	}
+
 	// TODO:
-	// 1. random order
-	// 2. packet loss
+	// 3. packet loss + random order
 }
