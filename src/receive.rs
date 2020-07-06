@@ -1,11 +1,9 @@
 use {
-	crate::sequence::Sequence,
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
-	log::{debug, error, info, trace, warn},
+	log::{/* debug, */ error, /* info, trace, */ warn},
 	std::{
-		cmp::{max, min},
-		collections::VecDeque,
-		io::{Cursor, Error, ErrorKind, Read, Seek, SeekFrom, Write},
+		cmp::min,
+		io::{Cursor, Read, Seek, SeekFrom, Write},
 		time::Instant,
 	},
 	thiserror::Error,
@@ -360,7 +358,6 @@ mod segment_tests {
 }
 
 pub struct Receiver {
-	packet_seq: Sequence,
 	missing: MissingSegments,
 	buffer: OchenCircusBuf,
 	buffer_start_offset: u64,
@@ -368,17 +365,16 @@ pub struct Receiver {
 }
 
 impl Receiver {
-	pub fn new() -> Receiver {
+	pub fn new(capacity: usize) -> Receiver {
 		Receiver {
-			packet_seq: Sequence::new(),
 			missing: MissingSegments::new(),
-			buffer: OchenCircusBuf::with_capacity(1024 * 1024),
+			buffer: OchenCircusBuf::with_capacity(capacity),
 			buffer_start_offset: 0,
 			stream_front: 0,
 		}
 	}
 
-	fn read_chunk_segment(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<usize> {
+	pub fn read_chunk_segment(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<usize> {
 		let mut rd = Cursor::new(&chunk);
 		let mut segment_begin = rd.read_u64::<LittleEndian>().unwrap();
 		let mut segment_data = &chunk[8..];
@@ -485,22 +481,7 @@ impl Receiver {
 		Ok(0)
 	}
 
-	pub fn receive_packet(&mut self, data: &[u8]) -> std::io::Result<usize> {
-		let now = Instant::now(); // TODO receive as argument?
-
-		// u32 packet sequence number
-		// chunks[]:
-		//  - u16 head:
-		//   	- high 4 bits: type/flags
-		//   	- low 11 bits: chunk size
-		//  - u8 data[chunk size]
-		//   	- type == 0
-		//      - u64 offset
-		//      - u8 payload[chunk size - 8]
-
-		let mut rd = Cursor::new(&data);
-		let packet_seq = rd.read_u32::<LittleEndian>()?;
-		let stream_front = rd.read_u64::<LittleEndian>()?;
+	pub fn update_stream_front(&mut self, stream_front: u64, now: Instant) {
 		if stream_front > self.stream_front {
 			self
 				.missing
@@ -508,82 +489,34 @@ impl Receiver {
 				.unwrap();
 			self.stream_front = stream_front;
 		}
-
-		loop {
-			let chunk_head = if let Ok(v) = rd.read_u16::<LittleEndian>() {
-				v
-			} else {
-				break;
-			};
-			let chunk_type = (chunk_head >> 11) as usize;
-			let chunk_size = (chunk_head & 2047) as usize;
-			let offset = rd.position() as usize;
-			if offset + chunk_size > data.len() {
-				// TODO might have handled some chunks, how to report?
-				return Err(Error::new(
-					ErrorKind::UnexpectedEof,
-					format!(
-						"Chunk type {} size {} at offset {} ends abruptly: left {} bytes in packet",
-						chunk_type,
-						chunk_size,
-						offset,
-						data.len() - offset,
-					),
-				));
-			}
-			let chunk_data = &data[offset..offset + chunk_size];
-			rd.seek(SeekFrom::Current(chunk_size as i64)).unwrap();
-
-			match chunk_type {
-				0 => {
-					// Regular data segment chunk
-					self.read_chunk_segment(chunk_data, now)?;
-				}
-				_ => {
-					// TODO might have handled some chunks, how to report?
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						format!("Unknown chunk type {} with size {}", chunk_type, chunk_size),
-					));
-				}
-			}
-		}
-
-		Ok(rd.position() as usize)
 	}
 
-	pub fn gen_feedback_packet(
+	pub fn make_chunk_feedback(
 		&mut self,
-		buf: &mut [u8], /* TODO filter by Instant */
+		// FIXME older_than: Instant,
+		buf: &mut [u8],
 	) -> std::io::Result<usize> {
-		// check that there's enough space to write at least one header
-		if buf.len() < 14 {
-			return Ok(0); // TODO or error?
+		let mut left = buf.len();
+
+		if left < 2 + 8 {
+			return Ok(0);
 		}
 
-		let mut left = buf.len() - 4;
 		let mut wr = Cursor::new(buf);
-		wr.write_u32::<LittleEndian>(self.packet_seq.next())
-			.unwrap();
 
 		// Put chunk header placeholder
-		let chunk_header_offset = wr.position();
 		let header: u16 = (1u16 << 11) | 0 as u16;
-		left -= 2;
 		wr.write_u16::<LittleEndian>(header).unwrap();
+		left -= 2;
 
 		// write consumed offset placeholder
-		left -= 14;
 		wr.write_u64::<LittleEndian>(self.buffer_start_offset)
 			.unwrap();
+		left -= 8;
 
 		let mut consumed_offset = None;
 		let mut iter = self.missing.missing_iter();
 		loop {
-			if left < 12 {
-				break;
-			}
-
 			let segment = match iter.next() {
 				Some(segment) => segment,
 				None => break,
@@ -593,6 +526,10 @@ impl Receiver {
 				consumed_offset = Some(segment.begin);
 			}
 
+			if left < 12 {
+				break;
+			}
+
 			wr.write_u64::<LittleEndian>(segment.begin).unwrap();
 			let size = segment.end - segment.begin;
 			wr.write_u32::<LittleEndian>(size as u32).unwrap();
@@ -600,9 +537,10 @@ impl Receiver {
 		}
 
 		let wr_end = wr.position();
-		let chunk_size = wr_end - chunk_header_offset - 2;
+		let chunk_size = wr_end - 2;
 
-		wr.seek(SeekFrom::Start(chunk_header_offset)).unwrap();
+		// Write final chunk size
+		wr.seek(SeekFrom::Start(0)).unwrap();
 		let header: u16 = (1u16 << 11) | chunk_size as u16;
 		wr.write_u16::<LittleEndian>(header).unwrap();
 		if let Some(offset) = consumed_offset {
@@ -659,38 +597,33 @@ mod receiver_tests {
 	}
 
 	struct Packet<'a> {
-		seq: u32,
 		front: usize,
 		segments: &'a [Segment<'a>],
 	}
 
 	fn push_packet(recv: &mut Receiver, pkt: &Packet) {
 		let mut buf = [0u8; 1500];
-		let mut c = Cursor::new(&mut buf[..]);
+		let now = Instant::now();
 
-		c.write_u32::<LittleEndian>(pkt.seq).unwrap();
-		c.write_u64::<LittleEndian>(pkt.front as u64).unwrap();
+		recv.update_stream_front(pkt.front as u64, now);
 
 		for seg in pkt.segments {
-			let header: u16 = (0u16 << 11) | (seg.data.len() + 8) as u16;
-			c.write_u16::<LittleEndian>(header).unwrap();
+			let mut c = Cursor::new(&mut buf[..]);
 			c.write_u64::<LittleEndian>(seg.offset).unwrap();
 			assert_eq!(c.write(seg.data).unwrap(), seg.data.len());
+			let size = c.position() as usize;
+			recv.read_chunk_segment(&buf[..size], now).unwrap();
 		}
-
-		let size = c.position() as usize;
-		recv.receive_packet(&buf[..size]).unwrap();
 	}
 
 	#[test]
 	fn basic_packet_parse() {
-		let mut recv = Receiver::new();
+		let mut recv = Receiver::new(1024);
 
 		let data = &b"SHLANG"[..];
 		push_packet(
 			&mut recv,
 			&Packet {
-				seq: 0,
 				front: data.len(),
 				segments: &[Segment {
 					offset: 0,
@@ -706,13 +639,12 @@ mod receiver_tests {
 
 	#[test]
 	fn basic_packet_parse_2seg() {
-		let mut recv = Receiver::new();
+		let mut recv = Receiver::new(1024);
 
 		let data = &b"SHLANGOKEFIR"[..];
 		push_packet(
 			&mut recv,
 			&Packet {
-				seq: 0,
 				front: data.len(),
 				segments: &[
 					Segment {
@@ -734,13 +666,12 @@ mod receiver_tests {
 
 	#[test]
 	fn packet_out_of_order() {
-		let mut recv = Receiver::new();
+		let mut recv = Receiver::new(1024);
 
 		let data = &b"SHLANGOBIDON"[..];
 		push_packet(
 			&mut recv,
 			&Packet {
-				seq: 1,
 				front: data.len(),
 				segments: &[Segment {
 					offset: 7,
@@ -752,7 +683,6 @@ mod receiver_tests {
 		push_packet(
 			&mut recv,
 			&Packet {
-				seq: 0,
 				front: data.len(),
 				segments: &[Segment {
 					offset: 0,

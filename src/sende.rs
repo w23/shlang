@@ -1,17 +1,11 @@
 use {
-	crate::sequence::Sequence,
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
-	log::{debug, error, info, trace, warn},
+	log::error,
 	ranges::{GenericRange, Ranges},
-	//core::num::Wrapping,
 	std::{
-		collections::VecDeque,
-		//error::Error,
-		//fmt,
-		io::{Cursor, Error, ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
+		io::{Cursor, ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
 		ops::{Bound, RangeBounds},
-		//vec::Vec,
 	},
 	thiserror::Error,
 };
@@ -131,7 +125,6 @@ pub struct Sender {
 	buffer: CircBuf,
 	segments: Ranges<u64>,
 	buffer_start_offset: u64,
-	packet_seq: Sequence,
 }
 
 impl Sender {
@@ -140,7 +133,6 @@ impl Sender {
 			buffer: CircBuf::with_capacity(buffer_capacity).unwrap(),
 			segments: Ranges::new(),
 			buffer_start_offset: 0,
-			packet_seq: Sequence::new(),
 		}
 	}
 
@@ -153,34 +145,17 @@ impl Sender {
 		Ok(read)
 	}
 
-	pub fn generate(&mut self, buf: &mut [u8]) -> Result<usize, SenderError> {
-		// u32 packet sequence number
-		// chunks[]:
-		//  - u16 head:
-		//   	- high 4 bits: type/flags
-		//   	- low 11 bits: chunk size
-		//  - u8 data[chunk size]
-		//   	- type == 0
-		//      - u64 offset
-		//      - u8 payload[chunk size - 8]
+	pub fn stream_front(&self) -> u64 {
+		self.buffer_start_offset + self.buffer.len() as u64
+	}
 
-		// check that there's enough space to write at least one header
-		if buf.len() < 14 {
-			return Err(SenderError::BufferTooSmall);
-		}
-
-		let mut left = buf.len() - 4;
-		let mut wr = Cursor::new(buf);
-		wr.write_u32::<LittleEndian>(self.packet_seq.next())
-			.unwrap();
-
-		left -= 8;
-		wr.write_u64::<LittleEndian>(self.buffer_start_offset + self.buffer.len() as u64)
-			.unwrap();
+	pub fn make_chunk_payload(&mut self, buf: &mut [u8]) -> Result<usize, SenderError> {
+		let mut left = buf.len();
+		let mut wr = Cursor::new(&mut buf[..]);
 
 		// Iterate through segments to write and build payload
 		for it in self.segments.as_slice() {
-			if left < 1 + 4 + 8 {
+			if left < 2 + 8 + 1 {
 				break;
 			}
 
@@ -191,7 +166,7 @@ impl Sender {
 			left -= 2;
 
 			let size = std::cmp::min(segment.size + 8, left);
-			assert!(size < 2048);
+			assert!(size < 2048); // TODO solve (needs mutating self.segments)
 
 			let header: u16 = (0u16 << 11) | size as u16;
 			wr.write_u16::<LittleEndian>(header).unwrap();
@@ -214,7 +189,7 @@ impl Sender {
 		let buf = wr.get_mut();
 
 		// Re-read packet and remove written segments from list of segments to write
-		let mut rd = Cursor::new(&buf[12..written]);
+		let mut rd = Cursor::new(&buf[..written]);
 		loop {
 			let header = match rd.read_u16::<LittleEndian>() {
 				Ok(value) => value,
@@ -235,7 +210,7 @@ impl Sender {
 		Ok(written)
 	}
 
-	pub fn confirm_read(&mut self, offset: u64) -> Result<usize, SenderError> {
+	fn confirm_read(&mut self, offset: u64) -> Result<usize, SenderError> {
 		if offset < self.buffer_start_offset {
 			return Ok(0);
 		}
@@ -253,7 +228,7 @@ impl Sender {
 		Ok(advance)
 	}
 
-	pub fn resend(&mut self, offset: u64, size: u32) -> Result<(u64, u32), SenderError> {
+	fn resend(&mut self, offset: u64, size: u32) -> Result<(u64, u32), SenderError> {
 		let end = offset + size as u64;
 		if end < self.buffer_start_offset {
 			return Err(SenderError::RequestedSegmentAlreadyConfirmed {
@@ -274,7 +249,7 @@ impl Sender {
 		Ok((offset, (end - offset) as u32))
 	}
 
-	fn read_chunk_feedback(&mut self, chunk: &[u8]) -> Result<(), SenderError> {
+	pub fn read_chunk_feedback(&mut self, chunk: &[u8]) -> Result<(), SenderError> {
 		let mut rd = Cursor::new(&chunk);
 		let consumed_offset = rd.read_u64::<LittleEndian>()?;
 		self.confirm_read(dbg!(consumed_offset))?;
@@ -296,74 +271,6 @@ impl Sender {
 
 		Ok(())
 	}
-
-	pub fn receive_feedback(&mut self, data: &[u8]) -> Result<(), SenderError> {
-		// u32 packet sequence number
-		// chunks[]:
-		//  - u16 head:
-		//   	- high 4 bits: type/flags
-		//   	- low 11 bits: chunk size
-		//  - u8 data[chunk size]
-		//   	- type == 0
-		//      - u64 offset
-		//      - u8 payload[chunk size - 8]
-		//   	- type == 1
-		//      - u64 confirm_offset
-		//      - [] chunks to resend
-		//      	- u64 offset
-		//      	- u16 size
-
-		let mut rd = Cursor::new(&data);
-		let packet_seq = rd.read_u32::<LittleEndian>()?;
-
-		loop {
-			let chunk_head = if let Ok(v) = rd.read_u16::<LittleEndian>() {
-				v
-			} else {
-				break;
-			};
-			let chunk_type = (chunk_head >> 11) as usize;
-			let chunk_size = (chunk_head & 2047) as usize;
-			let offset = rd.position() as usize;
-			if offset + chunk_size > data.len() {
-				// TODO might have handled some chunks, how to report?
-				// TODO better error reporting vs logging
-				println!(
-					"Chunk type {} size {} at offset {} ends abruptly: left {} bytes in packet",
-					chunk_type,
-					chunk_size,
-					offset,
-					data.len() - offset,
-				);
-				return Err(SenderError::IoError {
-					kind: ErrorKind::UnexpectedEof,
-				});
-			}
-			let chunk_data = &data[offset..offset + chunk_size];
-			rd.seek(SeekFrom::Current(chunk_size as i64)).unwrap();
-
-			println!(
-				"chunk @{} sz={} contents:{:?}",
-				offset, chunk_size, chunk_data
-			);
-
-			match chunk_type {
-				1 => {
-					// Regular data segment chunk
-					self.read_chunk_feedback(chunk_data)?;
-				}
-				_ => {
-					// TODO might have handled some chunks, how to report?
-					error!("Unknown chunk type {} with size {}", chunk_type, chunk_size);
-					return Err(SenderError::IoError {
-						kind: ErrorKind::InvalidData,
-					});
-				}
-			}
-		}
-
-		Ok(())
-	}
 }
 
 #[cfg(test)]
@@ -375,25 +282,20 @@ mod packet_tests {
 		assert_eq!(packetizer.write_from(&mut source).unwrap(), data.len());
 	}
 
-	fn check_single_fragment_data(
-		packetizer: &mut Sender,
+	fn check_single_payload_chunk(
+		sender: &mut Sender,
 		expect_data: &[u8],
-		expect_packet_seq: u32,
 		expect_offset: u64,
 		sent_so_far: &mut usize,
 	) {
-		let header_size = 4 + 2 + 8 + 8;
+		let header_size = 2 + 8;
 		let mut buffer = vec![0u8; expect_data.len() + header_size];
-		let packet_size = packetizer.generate(&mut buffer).unwrap();
-		assert_eq!(packet_size, header_size + expect_data.len());
+		let chunk_size = sender.make_chunk_payload(&mut buffer).unwrap();
+		assert_eq!(chunk_size, header_size + expect_data.len());
 
 		println!("{:?}", &buffer);
 
 		let mut r = Cursor::new(&buffer);
-		let packet_seq = r.read_u32::<LittleEndian>().unwrap();
-		assert_eq!(expect_packet_seq, packet_seq);
-
-		let _front = r.read_u64::<LittleEndian>().unwrap();
 
 		let chunk_header = r.read_u16::<LittleEndian>().unwrap();
 		let chunk_type = chunk_header >> 11;
@@ -424,17 +326,11 @@ mod packet_tests {
 
 		let data = &b"keque...."[..];
 		write_data(&mut packetizer, &data[..]);
-		check_single_fragment_data(&mut packetizer, &data, 0, 0, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data, 0, &mut sent_so_far);
 
 		let data = &b"qeqkekek"[..];
 		write_data(&mut packetizer, &data[..]);
-		check_single_fragment_data(
-			&mut packetizer,
-			&data,
-			1,
-			sent_so_far as u64,
-			&mut sent_so_far,
-		);
+		check_single_payload_chunk(&mut packetizer, &data, sent_so_far as u64, &mut sent_so_far);
 	}
 
 	#[test]
@@ -444,9 +340,9 @@ mod packet_tests {
 
 		let data = &b"IAmALongStringLOOOOOOOOOOOOOOOOOOOOL"[..];
 		write_data(&mut packetizer, &data[..]);
-		check_single_fragment_data(&mut packetizer, &data[0..17], 0, 0, &mut sent_so_far);
-		check_single_fragment_data(&mut packetizer, &data[17..23], 1, 17, &mut sent_so_far);
-		check_single_fragment_data(&mut packetizer, &data[23..], 2, 23, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[0..17], 0, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[17..23], 17, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[23..], 23, &mut sent_so_far);
 	}
 
 	#[test]
@@ -457,8 +353,8 @@ mod packet_tests {
 		let data = &b"IAmALongStringLOOOOOOOOOOOOOOOOOOOOL"[..];
 		write_data(&mut packetizer, &data[..]);
 		assert_eq!(packetizer.confirm_read(17).unwrap(), 17);
-		check_single_fragment_data(&mut packetizer, &data[17..23], 0, 17, &mut sent_so_far);
-		check_single_fragment_data(&mut packetizer, &data[23..], 1, 23, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[17..23], 17, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[23..], 23, &mut sent_so_far);
 	}
 
 	#[test]
@@ -468,19 +364,13 @@ mod packet_tests {
 
 		let data = &b"0123456"[..];
 		write_data(&mut packetizer, &data[..]);
-		check_single_fragment_data(&mut packetizer, &data, 0, 0, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data, 0, &mut sent_so_far);
 
 		assert_eq!(packetizer.confirm_read(5).unwrap(), 5);
 
 		let data = &b"789ab"[..];
 		write_data(&mut packetizer, &data[..]);
-		check_single_fragment_data(
-			&mut packetizer,
-			&data,
-			1,
-			sent_so_far as u64,
-			&mut sent_so_far,
-		);
+		check_single_payload_chunk(&mut packetizer, &data, sent_so_far as u64, &mut sent_so_far);
 	}
 
 	#[test]
@@ -491,14 +381,14 @@ mod packet_tests {
 		let data = &b"IAmALongStringLOOOOOOOOOOOOOOOOOOOOL"[..];
 		write_data(&mut packetizer, &data[..]);
 
-		check_single_fragment_data(&mut packetizer, &data[0..17], 0, 0, &mut sent_so_far);
-		check_single_fragment_data(&mut packetizer, &data[17..23], 1, 17, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[0..17], 0, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[17..23], 17, &mut sent_so_far);
 		assert_eq!(packetizer.resend(10, 10).unwrap(), (10, 10));
 
 		sent_so_far = 10;
-		check_single_fragment_data(&mut packetizer, &data[10..20], 2, 10, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[10..20], 10, &mut sent_so_far);
 
 		println!("{:?}", packetizer.segments);
-		check_single_fragment_data(&mut packetizer, &data[23..], 3, 23, &mut sent_so_far);
+		check_single_payload_chunk(&mut packetizer, &data[23..], 23, &mut sent_so_far);
 	}
 }
