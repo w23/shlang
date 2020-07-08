@@ -136,6 +136,11 @@ impl Sender {
 		}
 	}
 
+	// unconfirmed left to send
+	pub fn len(&self) -> usize {
+		self.buffer.len()
+	}
+
 	pub fn write_from(&mut self, source: &mut dyn CircRead) -> std::io::Result<usize> {
 		let begin = self.buffer_start_offset + self.buffer.len() as u64;
 		let read = source.read(&mut self.buffer)?;
@@ -183,6 +188,8 @@ impl Sender {
 			write_from_offset(&mut self.buffer, buffer_offset as usize, &mut dest).unwrap();
 			wr.seek(SeekFrom::Current((size - 8) as i64)).unwrap();
 			left -= size as usize;
+
+			println!("wr={}, size={}, left={}", wr.position(), size, left);
 		}
 
 		let written = wr.position() as usize;
@@ -202,6 +209,8 @@ impl Sender {
 
 			let offset = rd.read_u64::<LittleEndian>().unwrap();
 			let payload_size = size - 8;
+
+			println!("read size={}", size);
 
 			self.segments.remove(offset..offset + payload_size as u64);
 			rd.seek(SeekFrom::Current(payload_size)).unwrap();
