@@ -372,6 +372,39 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn send_receive_reordered_both() {
+		run_single_transfer_test(
+			1,
+			1024 * 1024,
+			32 * 1024,
+			&mut BufferedReorderNetwork::new(2, 16),
+			&mut BufferedReorderNetwork::new(2, 16),
+		);
+	}
+
+	#[test]
+	fn send_receive_loss_10pct_both() {
+		run_single_transfer_test(
+			1,
+			1024 * 1024,
+			32 * 1024,
+			&mut LosingPacketsNetwork::new(2, 10),
+			&mut LosingPacketsNetwork::new(2, 10),
+		);
+	}
+
+	#[test]
+	fn send_receive_loss_90pct_both() {
+		run_single_transfer_test(
+			1,
+			1024 * 1024,
+			32 * 1024,
+			&mut LosingPacketsNetwork::new(2, 90),
+			&mut LosingPacketsNetwork::new(2, 90),
+		);
+	}
+
 	// TODO:
 	// 3. packet loss + random order
 	// 4. all of the same + duplex transfer

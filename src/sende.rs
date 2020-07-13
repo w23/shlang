@@ -2,6 +2,7 @@ use {
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
 	log::error,
+	log::warn,
 	ranges::{GenericRange, Ranges},
 	std::{
 		io::{Cursor, ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
@@ -275,7 +276,14 @@ impl Sender {
 
 			println!("read resend: {} {}", offset, size);
 
-			self.resend(offset, size)?;
+			match self.resend(offset, size) {
+				Err(SenderError::RequestedSegmentAlreadyConfirmed { offset }) => {
+					warn!("Received (stale?) request for segment before confirmed offset {}, ignoring the rest of the packet", offset);
+					break;
+				}
+				Err(e) => return Err(e),
+				_ => {}
+			}
 		}
 
 		Ok(())
