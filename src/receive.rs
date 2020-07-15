@@ -550,11 +550,9 @@ impl Receiver {
 
 		Ok(wr_end as usize)
 	}
-}
 
-impl Read for Receiver {
-	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		let size = match self.missing.first() {
+	pub fn data_to_read(&self) -> usize {
+		match self.missing.first() {
 			Some(offset) => {
 				println!("missing first={}", offset);
 				(offset - self.buffer_start_offset) as usize
@@ -563,7 +561,13 @@ impl Read for Receiver {
 				println!("buffer len={}", self.buffer.len());
 				self.buffer.len()
 			}
-		};
+		}
+	}
+}
+
+impl Read for Receiver {
+	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+		let size = self.data_to_read();
 
 		let buf_len = buf.len();
 		let dest = &mut buf[..min(buf_len, size)];

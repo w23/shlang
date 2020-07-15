@@ -8,28 +8,34 @@ use {
 		io::{Cursor, ErrorKind, Read, Seek, SeekFrom},
 		time::{Duration, Instant},
 	},
-	//thiserror::Error,
+	thiserror::Error,
 };
+
+#[derive(Error, Debug, Clone)]
+pub enum ConnectionError {
+	#[error("Asked to generate a packet way before its time")]
+	PrematurePacket { next: Instant, now: Instant },
+}
 
 pub struct Connection {
 	// mtu: usize,
 	send_delay: Duration,
-	retransmit_delay: Duration,
+	retransmit_delay: Duration, // FIXME use this
 
 	packet_seq: Sequence,
 
 	sender: Sender,
-	next_send_time: Instant,
+	prev_packet_time: Instant,
 
 	receiver: Receiver,
 }
 
 pub struct ConnectionParams {
 	// mtu: usize,
-	send_delay: Duration,
-	retransmit_delay: Duration,
-	send_buffer_size: usize,
-	recv_buffer_size: usize,
+	pub send_delay: Duration,
+	pub retransmit_delay: Duration,
+	pub send_buffer_size: usize,
+	pub recv_buffer_size: usize,
 }
 
 impl Connection {
@@ -43,7 +49,7 @@ impl Connection {
 			packet_seq: Sequence::new(),
 
 			sender: Sender::new(params.send_buffer_size),
-			next_send_time: now,
+			prev_packet_time: now,
 
 			receiver: Receiver::new(params.recv_buffer_size),
 		}
@@ -128,10 +134,26 @@ impl Connection {
 	}
 
 	pub fn next_packet_time(&self) -> Instant {
-		self.next_send_time
+		if self.send_left() > 0 {
+			self.prev_packet_time + self.send_delay
+		} else {
+			self.prev_packet_time + self.retransmit_delay
+		}
 	}
 
-	pub fn generate_packet(&mut self, packet: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+	pub fn generate_packet(
+		&mut self,
+		now: Instant,
+		packet: &mut [u8],
+	) -> Result<usize, Box<dyn Error>> {
+		let next_send_time = self.next_packet_time();
+		if now < next_send_time {
+			return Err(Box::new(ConnectionError::PrematurePacket {
+				next: next_send_time,
+				now,
+			}));
+		}
+
 		// check that there's enough space to write at least one header
 		if packet.len() < 14 {
 			return Err(Box::new(SenderError::BufferTooSmall));
@@ -164,6 +186,8 @@ impl Connection {
 			header_size, feedback_size, payload_size
 		);
 
+		// FIXME What if now is way too large?
+		self.prev_packet_time = self.next_packet_time();
 		Ok(header_size + feedback_size + payload_size)
 	}
 
@@ -173,6 +197,10 @@ impl Connection {
 
 	pub fn send_left(&self) -> usize {
 		self.sender.len()
+	}
+
+	pub fn data_to_read(&self) -> usize {
+		self.receiver.data_to_read()
 	}
 }
 
