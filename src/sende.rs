@@ -1,8 +1,7 @@
 use {
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
 	circbuf::CircBuf,
-	log::error,
-	log::warn,
+	log::{debug, error, trace, warn},
 	ranges::{GenericRange, Ranges},
 	std::{
 		io::{Cursor, ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
@@ -17,7 +16,7 @@ pub trait CircRead {
 
 pub struct ReadPipe<T: Read> {
 	pipe: T,
-	readable: bool,
+	pub readable: bool,
 }
 
 impl<T: Read> ReadPipe<T> {
@@ -142,6 +141,10 @@ impl Sender {
 		self.buffer.len()
 	}
 
+	pub fn capacity(&self) -> usize {
+		self.buffer.avail()
+	}
+
 	pub fn write_from(&mut self, source: &mut dyn CircRead) -> std::io::Result<usize> {
 		let begin = self.buffer_start_offset + self.buffer.len() as u64;
 		let read = source.read(&mut self.buffer)?;
@@ -166,7 +169,7 @@ impl Sender {
 			}
 
 			let segment: Segment = it.into();
-			//println!("segment {} {}", segment.offset, segment.size);
+			//trace!("segment {} {}", segment.offset, segment.size);
 
 			// header
 			left -= 2;
@@ -190,7 +193,7 @@ impl Sender {
 			wr.seek(SeekFrom::Current((size - 8) as i64)).unwrap();
 			left -= size as usize;
 
-			println!("wr={}, size={}, left={}", wr.position(), size, left);
+			trace!("wr={}, size={}, left={}", wr.position(), size, left);
 		}
 
 		let written = wr.position() as usize;
@@ -211,7 +214,7 @@ impl Sender {
 			let offset = rd.read_u64::<LittleEndian>().unwrap();
 			let payload_size = size - 8;
 
-			println!("read size={}", size);
+			trace!("read size={}", size);
 
 			self.segments.remove(offset..offset + payload_size as u64);
 			rd.seek(SeekFrom::Current(payload_size)).unwrap();
@@ -262,7 +265,8 @@ impl Sender {
 	pub fn read_chunk_feedback(&mut self, chunk: &[u8]) -> Result<(), SenderError> {
 		let mut rd = Cursor::new(&chunk);
 		let consumed_offset = rd.read_u64::<LittleEndian>()?;
-		self.confirm_read(dbg!(consumed_offset))?;
+		debug!("consumed_offset = {}", consumed_offset);
+		self.confirm_read(consumed_offset)?;
 
 		loop {
 			// TODO better packing
@@ -274,7 +278,7 @@ impl Sender {
 
 			let size = rd.read_u32::<LittleEndian>()?;
 
-			println!("read resend: {} {}", offset, size);
+			trace!("read resend: {} {}", offset, size);
 
 			match self.resend(offset, size) {
 				Err(SenderError::RequestedSegmentAlreadyConfirmed { offset }) => {
@@ -287,6 +291,10 @@ impl Sender {
 		}
 
 		Ok(())
+	}
+
+	pub fn have_segments_to_send(&self) -> bool {
+		!self.segments.is_empty()
 	}
 }
 
@@ -310,7 +318,7 @@ mod packet_tests {
 		let chunk_size = sender.make_chunk_payload(&mut buffer).unwrap();
 		assert_eq!(chunk_size, header_size + expect_data.len());
 
-		println!("{:?}", &buffer);
+		trace!("{:?}", &buffer);
 
 		let mut r = Cursor::new(&buffer);
 
@@ -405,7 +413,7 @@ mod packet_tests {
 		sent_so_far = 10;
 		check_single_payload_chunk(&mut packetizer, &data[10..20], 10, &mut sent_so_far);
 
-		println!("{:?}", packetizer.segments);
+		trace!("{:?}", packetizer.segments);
 		check_single_payload_chunk(&mut packetizer, &data[23..], 23, &mut sent_so_far);
 	}
 }

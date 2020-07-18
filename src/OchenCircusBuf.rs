@@ -1,4 +1,8 @@
-use std::cmp::{max, min};
+use {
+	log::trace,
+	std::cmp::{max, min},
+};
+
 pub struct OchenCircusBuf {
 	buf: Box<[u8]>,
 	read: usize,
@@ -19,7 +23,7 @@ impl OchenCircusBuf {
 	}
 
 	pub fn write_data_at_read_offset(&mut self, offset: usize, data: &[u8]) -> usize {
-		println!(
+		trace!(
 			"[B] write off={} len={}, read={} written={}, self.len={}",
 			offset,
 			data.len(),
@@ -34,7 +38,7 @@ impl OchenCircusBuf {
 		let write_size = min(self.buf.len() - offset, data.len());
 		let write_pos = (self.read + offset) % self.buf.len();
 
-		println!("[B] write_size={} write_pos={}", write_size, write_pos);
+		trace!("[B] write_size={} write_pos={}", write_size, write_pos);
 
 		let chunk_size = min(write_size, self.buf.len() - write_pos);
 		self.buf[write_pos..write_pos + chunk_size].clone_from_slice(&data[..chunk_size]);

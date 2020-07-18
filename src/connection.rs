@@ -1,7 +1,7 @@
 use {
 	crate::{receive::*, sende::*, sequence::Sequence},
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
-	log::error,
+	log::{error, trace},
 	std::{
 		cmp::min,
 		error::Error,
@@ -73,6 +73,7 @@ impl Connection {
 	pub fn receive_packet(&mut self, now: Instant, packet: &[u8]) -> Result<(), Box<dyn Error>> {
 		let mut rd = Cursor::new(&packet);
 		let packet_seq = rd.read_u32::<LittleEndian>()?;
+		trace!("Received packet_seq = {}", packet_seq);
 
 		let stream_front = rd.read_u64::<LittleEndian>()?;
 		self.receiver.update_stream_front(stream_front, now);
@@ -86,13 +87,13 @@ impl Connection {
 			let chunk_type = (chunk_head >> 11) as usize;
 			let chunk_size = (chunk_head & 2047) as usize;
 
-			println!("chunk type={} size={}", chunk_type, chunk_size);
+			trace!("chunk type={} size={}", chunk_type, chunk_size);
 
 			let offset = rd.position() as usize;
 			if offset + chunk_size > packet.len() {
 				// TODO might have handled some chunks, how to report?
 				// TODO better error reporting vs logging
-				println!(
+				trace!(
 					"Chunk type {} size {} at offset {} ends abruptly: left {} bytes in packet",
 					chunk_type,
 					chunk_size,
@@ -106,9 +107,11 @@ impl Connection {
 			let chunk_data = &packet[offset..offset + chunk_size];
 			rd.seek(SeekFrom::Current(chunk_size as i64)).unwrap();
 
-			println!(
-				"chunk @{} sz={} contents:{:?}",
-				offset, chunk_size, chunk_data
+			trace!(
+				"chunk @{} sz={}", // contents:{:?}",
+				offset,
+				chunk_size,
+				//chunk_data
 			);
 
 			match chunk_type {
@@ -134,26 +137,14 @@ impl Connection {
 	}
 
 	pub fn next_packet_time(&self) -> Instant {
-		if self.send_left() > 0 {
+		if self.sender.have_segments_to_send() {
 			self.prev_packet_time + self.send_delay
 		} else {
 			self.prev_packet_time + self.retransmit_delay
 		}
 	}
 
-	pub fn generate_packet(
-		&mut self,
-		now: Instant,
-		packet: &mut [u8],
-	) -> Result<usize, Box<dyn Error>> {
-		let next_send_time = self.next_packet_time();
-		if now < next_send_time {
-			return Err(Box::new(ConnectionError::PrematurePacket {
-				next: next_send_time,
-				now,
-			}));
-		}
-
+	pub fn generate_packet(&mut self, packet: &mut [u8]) -> Result<usize, Box<dyn Error>> {
 		// check that there's enough space to write at least one header
 		if packet.len() < 14 {
 			return Err(Box::new(SenderError::BufferTooSmall));
@@ -181,14 +172,32 @@ impl Connection {
 			.sender
 			.make_chunk_payload(&mut packet[header_size + feedback_size..])?;
 
-		println!(
+		trace!(
 			"generated: {}, {}, {}",
-			header_size, feedback_size, payload_size
+			header_size,
+			feedback_size,
+			payload_size
 		);
 
-		// FIXME What if now is way too large?
-		self.prev_packet_time = self.next_packet_time();
 		Ok(header_size + feedback_size + payload_size)
+	}
+
+	pub fn packets_available(&self, now: Instant) -> usize {
+		let next_packet_time = self.next_packet_time();
+		trace!("now: {:?}, next: {:?}", now, next_packet_time);
+		if next_packet_time > now {
+			return 0;
+		}
+
+		1 + (((now - next_packet_time).as_nanos()) / self.send_delay.as_nanos()) as usize
+	}
+
+	pub fn have_data_to_send(&self) -> bool {
+		self.sender.have_segments_to_send()
+	}
+
+	pub fn update_sent_time(&mut self, now: Instant) {
+		self.prev_packet_time = now;
 	}
 
 	pub fn write_from(&mut self, source: &mut dyn CircRead) -> std::io::Result<usize> {
@@ -201,6 +210,10 @@ impl Connection {
 
 	pub fn data_to_read(&self) -> usize {
 		self.receiver.data_to_read()
+	}
+
+	pub fn buffer_free(&self) -> usize {
+		self.sender.capacity()
 	}
 }
 
@@ -228,7 +241,7 @@ mod tests {
 			let now = Instant::now();
 			let mut buf = [0u8; 1500];
 			let size = src.generate_packet(&mut buf).unwrap();
-			println!("New packet size = {}", size);
+			trace!("New packet size = {}", size);
 			dst.receive_packet(now, &buf[..size]).unwrap();
 
 			src.send_left() != 0
@@ -260,7 +273,7 @@ mod tests {
 				let mut buf = [0u8; 1500];
 				let size = src.generate_packet(&mut buf).unwrap();
 				self.packets.push(Box::new(buf[..size].to_vec()));
-				println!("New packet size={}", size);
+				trace!("New packet size={}", size);
 
 				if self.min_size_reached {
 					// FIXME (perf) just choose random slot instead
@@ -300,7 +313,7 @@ mod tests {
 			let now = Instant::now();
 			let mut buf = [0u8; 1500];
 			let size = src.generate_packet(&mut buf).unwrap();
-			println!("New packet size = {}", size);
+			trace!("New packet size = {}", size);
 			if self.rng.gen_range(0, 100) > self.percent {
 				dst.receive_packet(now, &buf[..size]).unwrap();
 			}
@@ -349,7 +362,7 @@ mod tests {
 
 			let mut buf = [0u8; 1500];
 			let read = receiver.read(&mut buf).unwrap();
-			println!("read {}", read);
+			trace!("read {}", read);
 			assert_eq!(&data[offset..offset + read], &buf[..read]);
 			offset += read;
 		}

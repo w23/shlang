@@ -1,9 +1,9 @@
 use {
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
-	log::{/* debug, */ error, /* info, trace, */ warn},
+	log::{debug, error, info, trace, warn},
 	std::{
 		cmp::min,
-		io::{Cursor, Read, Seek, SeekFrom, Write},
+		io::{Cursor, Read, Seek, SeekFrom},
 		time::Instant,
 	},
 	thiserror::Error,
@@ -388,11 +388,11 @@ impl Receiver {
 		if segment_begin < self.buffer_start_offset {
 			let shift = (self.buffer_start_offset - segment_begin) as usize;
 			segment_begin = self.buffer_start_offset;
-			segment_data = &segment_data[shift..segment_data.len() - shift];
+			segment_data = &segment_data[shift..segment_data.len()];
 		}
 
-		println!("buffer_start_offset={}", self.buffer_start_offset);
-		println!(
+		trace!("buffer_start_offset={}", self.buffer_start_offset);
+		debug!(
 			"Receive segment @{}..{} ({})",
 			segment_begin,
 			segment_end,
@@ -406,7 +406,7 @@ impl Receiver {
 				_ => break 'missing,
 			};
 
-			println!("  Missing {:?}", missing);
+			trace!("  Missing {:?}", missing);
 
 			// missing segment is fully before received segment
 			if missing.end <= segment_begin {
@@ -424,10 +424,10 @@ impl Receiver {
 			if missing.begin > segment_begin {
 				let shift = (missing.begin - segment_begin) as usize;
 				segment_begin = missing.begin;
-				segment_data = &segment_data[shift..segment_data.len() - shift];
+				segment_data = &segment_data[shift..segment_data.len()];
 			};
 
-			println!(
+			trace!(
 				"    segment_begin={} len={}",
 				segment_begin,
 				segment_data.len()
@@ -438,9 +438,12 @@ impl Receiver {
 			// Write received to buffer
 			let buf_offset = (segment_begin - self.buffer_start_offset) as usize;
 
-			println!(
+			trace!(
 				"    segment_begin={} write_end={} to_write_size={} buf_offset={}",
-				segment_begin, write_end, to_write_size, buf_offset
+				segment_begin,
+				write_end,
+				to_write_size,
+				buf_offset
 			);
 
 			let written = self
@@ -448,7 +451,13 @@ impl Receiver {
 				.write_data_at_read_offset(buf_offset, &segment_data[..to_write_size]);
 
 			if written < to_write_size {
-				panic!("Inconsistent missing vs buffer state. Could write only {} bytes of {} in the middle, offset = {}, global offset = {}", written, to_write_size, buf_offset, self.buffer_start_offset);
+				// FIXME Result<Err
+				debug!(
+					"    segment_begin={} write_end={} to_write_size={} buf_offset={}",
+					segment_begin, write_end, to_write_size, buf_offset
+				);
+				//debug!("");
+				error!("Inconsistent missing vs buffer state. Could write only {} bytes of {} in the middle, offset = {}, global offset = {}", written, to_write_size, buf_offset, self.buffer_start_offset);
 			}
 
 			// Update missing
@@ -554,11 +563,11 @@ impl Receiver {
 	pub fn data_to_read(&self) -> usize {
 		match self.missing.first() {
 			Some(offset) => {
-				println!("missing first={}", offset);
+				trace!("missing first={}", offset);
 				(offset - self.buffer_start_offset) as usize
 			}
 			None => {
-				println!("buffer len={}", self.buffer.len());
+				trace!("buffer len={}", self.buffer.len());
 				self.buffer.len()
 			}
 		}
@@ -594,6 +603,7 @@ impl Read for Receiver {
 #[cfg(test)]
 mod receiver_tests {
 	use super::*;
+	use std::io::Write;
 
 	struct Segment<'a> {
 		offset: u64,
@@ -691,6 +701,38 @@ mod receiver_tests {
 				segments: &[Segment {
 					offset: 0,
 					data: &data[..7],
+				}],
+			},
+		);
+
+		let mut buf = [0u8; 32];
+		assert_eq!(recv.read(&mut buf).unwrap(), data.len());
+		assert_eq!(&buf[..data.len()], data);
+	}
+
+	#[test]
+	fn packet_overlapping_missing() {
+		let mut recv = Receiver::new(1024);
+
+		let data = &b"SHLANGOBIDON"[..];
+		push_packet(
+			&mut recv,
+			&Packet {
+				front: data.len(),
+				segments: &[Segment {
+					offset: 0,
+					data: &data[..7],
+				}],
+			},
+		);
+
+		push_packet(
+			&mut recv,
+			&Packet {
+				front: data.len(),
+				segments: &[Segment {
+					offset: 4,
+					data: &data[4..],
 				}],
 			},
 		);
