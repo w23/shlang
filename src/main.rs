@@ -29,6 +29,7 @@ struct Args {
 	retransmit_delay: Duration,
 	send_buffer_size: usize,
 	recv_buffer_size: usize,
+	recv_only: bool,
 }
 
 const DEFAULT_VERBOSITY: usize = 3;
@@ -38,6 +39,7 @@ impl Args {
 	fn read() -> Result<Args, Box<dyn std::error::Error>> {
 		let mut args = pico_args::Arguments::from_env();
 		let listen = args.contains("-l");
+		let recv_only = args.contains("-r");
 		let verbosity = args.opt_value_from_str("-v")?.unwrap_or(DEFAULT_VERBOSITY);
 		let send_buffer_size = args
 			.opt_value_from_str("--send-size")?
@@ -73,6 +75,7 @@ impl Args {
 			mtu,
 			send_kbits_per_second,
 			retransmit_delay,
+			recv_only,
 		})
 	}
 
@@ -104,6 +107,30 @@ unsafe fn set_nonblocking(fd: RawFd) {
 	}
 }
 
+struct Source {
+	pipe: ReadPipe<std::io::Stdin>,
+	fd: RawFd,
+}
+
+impl Source {
+	fn new() -> Self {
+		let stdin = std::io::stdin();
+		let fd = stdin.as_raw_fd();
+		unsafe {
+			set_nonblocking(fd);
+		}
+		let mut mio_source = SourceFd(&fd);
+		Self {
+			pipe: ReadPipe::new(stdin),
+			fd,
+		}
+	}
+
+	fn mio_source(&self) -> SourceFd {
+		SourceFd(&self.fd)
+	}
+}
+
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	let mut poll = Poll::new()?;
 	let mut connected = false;
@@ -116,23 +143,34 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 		socket
 	};
 
-	const STDIN: Token = Token(0);
+	let send_delay =
+		Duration::from_secs_f32((8.0 * args.mtu as f32) / (1024 * args.send_kbits_per_second) as f32);
+
+	let mut conn = Connection::new(ConnectionParams {
+		send_delay,
+		retransmit_delay: args.retransmit_delay,
+		send_buffer_size: args.send_buffer_size,
+		recv_buffer_size: args.recv_buffer_size,
+	});
+
+	const SOURCE: Token = Token(0);
 	//const STDOUT: Token = Token(1);
 	const SOCKET: Token = Token(2);
 
-	let stdin = std::io::stdin();
-	let stdin_fd = stdin.as_raw_fd();
-	unsafe {
-		set_nonblocking(stdin_fd);
-	}
-	let mut stdin_source = SourceFd(&stdin_fd);
-	poll
-		.registry()
-		.register(&mut stdin_source, STDIN, Interest::READABLE)?;
+	let mut source = if !args.recv_only {
+		let source = Source::new();
+		poll
+			.registry()
+			.register(&mut source.mio_source(), SOURCE, Interest::READABLE)?;
+		Some(source)
+	} else {
+		conn.write_close();
+		None
+	};
 
 	let mut stdout = std::io::stdout();
-	let stdout_fd = stdout.as_raw_fd();
-	let mut stdout_fd = SourceFd(&stdout_fd);
+	// let stdout_fd = stdout.as_raw_fd();
+	// let mut stdout_source = SourceFd(&stdout_fd);
 	// poll
 	// 	.registry()
 	// 	.register(&mut stdout_fd, STDOUT, Interest::WRITABLE)?;
@@ -141,18 +179,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 		.registry()
 		.register(&mut socket, SOCKET, Interest::WRITABLE | Interest::READABLE)?;
 
-	let send_delay =
-		Duration::from_secs_f32((8.0 * args.mtu as f32) / (1024 * args.send_kbits_per_second) as f32);
-
 	info!("{:?}", send_delay);
-
-	let mut source = ReadPipe::new(stdin);
-	let mut conn = Connection::new(ConnectionParams {
-		send_delay,
-		retransmit_delay: args.retransmit_delay,
-		send_buffer_size: args.send_buffer_size,
-		recv_buffer_size: args.recv_buffer_size,
-	});
 
 	let mut buf = vec![0u8; args.mtu];
 	let mut events = Events::with_capacity(16);
@@ -208,6 +235,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 							conn.receive_packet(now, &buf[..size])?;
 
 							if conn.data_to_read() > 0 {
+								debug!("reading from stdout");
 								let written = std::io::copy(&mut conn, &mut stdout)?;
 								debug!("written to stdout: {}", written);
 								// TODO can stdout block?
@@ -220,8 +248,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 					}
 				}
 
-				STDIN => {
-					source.readable = event.is_readable();
+				SOURCE => {
+					let mut source = source.as_mut().unwrap();
+					source.pipe.readable = event.is_readable();
+					if event.is_read_closed() {
+						conn.write_close();
+						poll.registry().deregister(&mut source.mio_source())?;
+					}
 				}
 
 				// STDOUT => {
@@ -234,13 +267,18 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 		} // for event
 
 		// FIXME proper readable tracker
-		if source.readable && conn.buffer_free() > 0 {
-			let read = conn.write_from(&mut source)?;
-			trace!(
-				"read {} bytes from stdin, free: {}",
-				read,
-				conn.buffer_free()
-			);
+		match source {
+			Some(ref mut source) if source.pipe.readable && conn.buffer_free() > 0 => {
+				debug!("begin read");
+				let read = conn.write_from(&mut source.pipe)?;
+				debug!("end read");
+				trace!(
+					"read {} bytes from stdin, free: {}",
+					read,
+					conn.buffer_free()
+				);
+			}
+			_ => {}
 		}
 
 		if connected {
@@ -257,6 +295,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 			if num_packets > 0 {
 				conn.update_sent_time(now);
 			}
+		}
+
+		if conn.done() && conn.data_to_read() == 0 {
+			break 'outer;
 		}
 
 		let next_packet_time = conn.next_packet_time();

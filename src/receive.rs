@@ -148,6 +148,14 @@ impl MissingSegments {
 			_ => None,
 		}
 	}
+
+	fn total_size(&self) -> usize {
+		let mut missing_size = 0;
+		for segment in &self.segments {
+			missing_size += segment.end - segment.begin;
+		}
+		missing_size as usize
+	}
 }
 
 #[cfg(test)]
@@ -362,6 +370,7 @@ pub struct Receiver {
 	buffer: OchenCircusBuf,
 	buffer_start_offset: u64,
 	stream_front: u64,
+	last_sent_consumed_offset: u64,
 }
 
 impl Receiver {
@@ -371,6 +380,7 @@ impl Receiver {
 			buffer: OchenCircusBuf::with_capacity(capacity),
 			buffer_start_offset: 0,
 			stream_front: 0,
+			last_sent_consumed_offset: 0,
 		}
 	}
 
@@ -519,6 +529,7 @@ impl Receiver {
 		left -= 2;
 
 		// write consumed offset placeholder
+		let mut last_consumed_offset = self.buffer_start_offset;
 		wr.write_u64::<LittleEndian>(self.buffer_start_offset)
 			.unwrap();
 		left -= 8;
@@ -554,9 +565,11 @@ impl Receiver {
 		wr.write_u16::<LittleEndian>(header).unwrap();
 		if let Some(offset) = consumed_offset {
 			assert!(offset >= self.buffer_start_offset);
+			last_consumed_offset = offset;
 			wr.write_u64::<LittleEndian>(offset).unwrap();
 		}
 
+		self.last_sent_consumed_offset = last_consumed_offset;
 		Ok(wr_end as usize)
 	}
 
@@ -571,6 +584,12 @@ impl Receiver {
 				self.buffer.len()
 			}
 		}
+	}
+
+	pub fn done(&self) -> bool {
+		let missing_size = self.missing.total_size();
+		// if there are no missing segments, buffer_start_offset is stream front
+		missing_size == 0 && self.buffer_start_offset == self.last_sent_consumed_offset
 	}
 }
 

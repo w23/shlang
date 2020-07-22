@@ -137,7 +137,7 @@ impl Sender {
 	}
 
 	// unconfirmed left to send
-	pub fn len(&self) -> usize {
+	pub fn unconfirmed_size(&self) -> usize {
 		self.buffer.len()
 	}
 

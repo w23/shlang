@@ -26,8 +26,10 @@ pub struct Connection {
 
 	sender: Sender,
 	prev_packet_time: Instant,
+	sender_eof: bool,
 
 	receiver: Receiver,
+	receiver_eof: bool,
 }
 
 pub struct ConnectionParams {
@@ -50,12 +52,17 @@ impl Connection {
 
 			sender: Sender::new(params.send_buffer_size),
 			prev_packet_time: now,
+			sender_eof: false,
 
 			receiver: Receiver::new(params.recv_buffer_size),
+			receiver_eof: false,
 		}
 	}
 
 	// u32 packet sequence number
+	// u64 front offset
+	// 	- high 1 bit = eof
+	// 	- low 63 bit = offset
 	// chunks[]:
 	//  - u16 head:
 	//   	- high 4 bits: type/flags
@@ -76,6 +83,14 @@ impl Connection {
 		trace!("Received packet_seq = {}", packet_seq);
 
 		let stream_front = rd.read_u64::<LittleEndian>()?;
+		let eof = (stream_front >> 63) == 1;
+		self.receiver_eof = eof;
+		let stream_front = stream_front & !(1 << 63);
+		trace!(
+			"read eof={} stream_front={}",
+			self.receiver_eof,
+			stream_front
+		);
 		self.receiver.update_stream_front(stream_front, now);
 
 		loop {
@@ -156,8 +171,15 @@ impl Connection {
 			.unwrap();
 
 		left -= 8;
-		wr.write_u64::<LittleEndian>(self.sender.stream_front())
-			.unwrap();
+		let stream_front = self.sender.stream_front() & !(1 << 63);
+		assert_eq!(stream_front, self.sender.stream_front());
+		trace!(
+			"writing eof={} stream_front={}",
+			self.sender_eof,
+			stream_front
+		);
+		let stream_front = stream_front | ((self.sender_eof as u64) << 63);
+		wr.write_u64::<LittleEndian>(stream_front).unwrap();
 
 		let header_size = wr.position() as usize;
 
@@ -183,6 +205,9 @@ impl Connection {
 	}
 
 	pub fn packets_available(&self, now: Instant) -> usize {
+		if self.done() {
+			return 0;
+		}
 		let next_packet_time = self.next_packet_time();
 		trace!("now: {:?}, next: {:?}", now, next_packet_time);
 		if next_packet_time > now {
@@ -204,8 +229,12 @@ impl Connection {
 		self.sender.write_from(source)
 	}
 
+	pub fn write_close(&mut self) {
+		self.sender_eof = true;
+	}
+
 	pub fn send_left(&self) -> usize {
-		self.sender.len()
+		self.sender.unconfirmed_size()
 	}
 
 	pub fn data_to_read(&self) -> usize {
@@ -214,6 +243,13 @@ impl Connection {
 
 	pub fn buffer_free(&self) -> usize {
 		self.sender.capacity()
+	}
+
+	pub fn done(&self) -> bool {
+		self.sender_eof
+			&& self.sender.unconfirmed_size() == 0
+			&& self.receiver_eof
+			&& self.receiver.done()
 	}
 }
 
