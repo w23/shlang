@@ -6,12 +6,13 @@ mod sequence;
 
 use {
 	connection::{Connection, ConnectionParams},
+	libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK},
 	log::{debug, error, info, trace /* warn */},
 	mio::{net::UdpSocket, unix::SourceFd, Events, Interest, Poll, Token},
 	sende::ReadPipe,
 	std::{
 		net::{SocketAddr, ToSocketAddrs},
-		os::unix::io::AsRawFd,
+		os::unix::io::{AsRawFd, RawFd},
 		time::{Duration, Instant},
 	},
 };
@@ -82,6 +83,27 @@ impl Args {
 	}
 }
 
+unsafe fn set_nonblocking(fd: RawFd) {
+	let flags = fcntl(fd, F_GETFL, 0);
+	if flags < 0 {
+		panic!(
+			"Couldn't get fd {} flags: {}",
+			fd,
+			std::io::Error::last_os_error()
+		);
+	}
+
+	let flags = flags | O_NONBLOCK;
+	let result = fcntl(fd, F_SETFL, flags);
+	if result < 0 {
+		panic!(
+			"Couldn't set fd {} O_NOBLOCK flag: {}",
+			fd,
+			std::io::Error::last_os_error()
+		);
+	}
+}
+
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	let mut poll = Poll::new()?;
 	let mut connected = false;
@@ -100,10 +122,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 	let stdin = std::io::stdin();
 	let stdin_fd = stdin.as_raw_fd();
-	let mut stdin_fd = SourceFd(&stdin_fd);
+	unsafe {
+		set_nonblocking(stdin_fd);
+	}
+	let mut stdin_source = SourceFd(&stdin_fd);
 	poll
 		.registry()
-		.register(&mut stdin_fd, STDIN, Interest::READABLE)?;
+		.register(&mut stdin_source, STDIN, Interest::READABLE)?;
 
 	let mut stdout = std::io::stdout();
 	let stdout_fd = stdout.as_raw_fd();

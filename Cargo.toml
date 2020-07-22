@@ -16,6 +16,7 @@ circbuf = "0.1"
 byteorder = "1"
 thiserror = "1.0"
 ranges = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 rand = {version = "0.7", features = ["small_rng"]}
