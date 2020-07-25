@@ -1,6 +1,6 @@
 use {
 	byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
-	log::{debug, error, info, trace, warn},
+	log::*,
 	std::{
 		cmp::min,
 		io::{Cursor, Read, Seek, SeekFrom},
@@ -9,7 +9,7 @@ use {
 	thiserror::Error,
 };
 
-use crate::OchenCircusBuf::OchenCircusBuf;
+use crate::ochen_circus_buf::OchenCircusBuf;
 
 #[derive(Error, Debug, Clone, PartialEq)]
 enum SegmentationFault {
@@ -53,16 +53,16 @@ impl<'a> MissingSegmentIterator<'a> {
 		Some(item)
 	}
 
-	fn update_timestamp(&mut self, timestamp: Instant) -> Option<Instant> {
-		if self.next > self.segments.len() || self.next == 0 {
-			return None;
-		}
-
-		let item = &mut self.segments[self.next - 1];
-		let old_timestamp = item.timestamp;
-		item.timestamp = timestamp;
-		Some(old_timestamp)
-	}
+	// fn update_timestamp(&mut self, timestamp: Instant) -> Option<Instant> {
+	// 	if self.next > self.segments.len() || self.next == 0 {
+	// 		return None;
+	// 	}
+	//
+	// 	let item = &mut self.segments[self.next - 1];
+	// 	let old_timestamp = item.timestamp;
+	// 	item.timestamp = timestamp;
+	// 	Some(old_timestamp)
+	// }
 
 	fn cut_range(&mut self, cut_begin: u64, cut_end: u64, timestamp: Instant) {
 		// -> Result<(), SegmentationFault> {
@@ -389,7 +389,7 @@ impl Receiver {
 		let mut segment_begin = rd.read_u64::<LittleEndian>().unwrap();
 		let mut segment_data = &chunk[8..];
 
-		let mut segment_end = segment_begin + segment_data.len() as u64;
+		let segment_end = segment_begin + segment_data.len() as u64;
 		if segment_end <= self.buffer_start_offset {
 			// Segment is too old, skip
 			return Ok(0);
@@ -416,7 +416,7 @@ impl Receiver {
 				_ => break 'missing,
 			};
 
-			trace!("  Missing {:?}", missing);
+			// trace!("  Missing {:?}", missing);
 
 			// missing segment is fully before received segment
 			if missing.end <= segment_begin {

@@ -1,5 +1,5 @@
-mod OchenCircusBuf;
 mod connection;
+mod ochen_circus_buf;
 mod receive;
 mod sende;
 mod sequence;
@@ -119,7 +119,6 @@ impl Source {
 		unsafe {
 			set_nonblocking(fd);
 		}
-		let mut mio_source = SourceFd(&fd);
 		Self {
 			pipe: ReadPipe::new(stdin),
 			fd,
@@ -235,11 +234,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 							conn.receive_packet(now, &buf[..size])?;
 
 							if conn.data_to_read() > 0 {
-								debug!("reading from stdout");
+								debug!("writing to stdout");
 								let written = std::io::copy(&mut conn, &mut stdout)?;
 								debug!("written to stdout: {}", written);
 								// TODO can stdout block?
 							}
+
+							// FIXME send timed feedback too
 						} // pull all packets
 
 						if recv_error.is_some() {
@@ -325,6 +326,7 @@ fn main() {
 	stderrlog::new()
 		.module(module_path!())
 		.verbosity(args.verbosity)
+		.timestamp(stderrlog::Timestamp::Microsecond)
 		.init()
 		.unwrap();
 

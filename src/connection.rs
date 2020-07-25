@@ -8,14 +8,14 @@ use {
 		io::{Cursor, ErrorKind, Read, Seek, SeekFrom},
 		time::{Duration, Instant},
 	},
-	thiserror::Error,
+	//thiserror::Error,
 };
 
-#[derive(Error, Debug, Clone)]
-pub enum ConnectionError {
-	#[error("Asked to generate a packet way before its time")]
-	PrematurePacket { next: Instant, now: Instant },
-}
+// #[derive(Error, Debug, Clone)]
+// pub enum ConnectionError {
+// 	#[error("Asked to generate a packet way before its time")]
+// 	PrematurePacket { next: Instant, now: Instant },
+// }
 
 pub struct Connection {
 	// mtu: usize,
@@ -233,6 +233,7 @@ impl Connection {
 		self.sender_eof = true;
 	}
 
+	#[cfg(test)]
 	pub fn send_left(&self) -> usize {
 		self.sender.unconfirmed_size()
 	}

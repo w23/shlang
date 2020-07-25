@@ -1,0 +1,66 @@
+- better args:
+	- auto usage
+	- auto-parsing to Args struct
+- better logs:
+	- nested context
+	+ timestamps
+	- per-module verbosity
+	- extra cheap
+		- ring buffer of messages
+			- (can't save temporary strings; maybe can save first N bytes of them?)
+		- no real-time formatting
+		- printf in another thread?
+		- binary dump into file works too
+- benchmark
+	- local max transfer rate in release
+	- perf report
+	- cargo bench?
+- non-blocking stdout
+- cleanse warnings
+- ? direct file i/o support (instead of piping stdi/o)
+- sane error handling
+- better packet rate control
+	- accumulation model
+	- packet at-once limit
+- send feedback in packet receive loop
+- collect stats and export them to make graphs
+	- raw http (tcp socket + basic parsing)
+	- export raw ring buf data
+	- d3 plotter
+- fight allocations
+	- chrono strftime always allocates
+		- used by stderrlog
+			- need OchenLog ;_;
+		-	stderrlog also allocated kak ne v sebya
+- epoll_wait sleep granularity is 1ms
+	- alternative?
+	- timerfd?
+- read_u16..64 generate errors? ~1%
+	- check verbose logs
+
+perf:
+	- subtracting time is expensive: >200ms (~4%) for a test run of 4.7 sec; more expensive than recv_frm!
+	-	Connection::done ~400ms (~7%)
+		- due to iterating through missing segments in Receve::MissingSegments::total_size()
+		- easy fix: don't iterate, done only needs to know that they're there
+	- packets available ~500ms (~9%)
+		- same reason as Connection::done above, and the same easy fix
+	- Instant::now() ~800ms (~15%)
+		- call it only once per event loop iteration
+		- no idea how to optimize
+	- read_u16..64 generate errors? ~1%
+
+later:
+- collect metrics:
+	- necessary overhead
+	- retransmit overhead
+		- unnecessary retransmit
+- connection health control and monitoring
+	- MTU
+	- RTT
+	- packet loss
+	- buffer overflow model
+	- other models? uTP?
+- port forwarding: listen on/connect to TCP
+- connection aggregation: multiple UDP connections to different host:port which form a single logical connection
+	- different modes: raid0 raid1, ...
